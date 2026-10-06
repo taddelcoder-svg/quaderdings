@@ -330,7 +330,8 @@
     let ax = (eing.rechts ? 1 : 0) - (eing.links ? 1 : 0) + achse.x, az = (eing.rueck ? 1 : 0) - (eing.vor ? 1 : 0) + achse.z;
     const l = Math.hypot(ax, az);
     if (l > 1) { ax /= l; az /= l; }
-    let tempo = s.fliegen ? (eing.laufen ? 22 : 11) : (eing.laufen ? 5.9 : 4.3);
+    const renn = eing.laufen || stickLaufen;
+    let tempo = s.fliegen ? (renn ? 22 : 11) : (renn ? 5.9 : 4.3);
     if (s.imWasser && !s.fliegen) tempo *= 0.6;
     const sn = Math.sin(s.yaw), cs = Math.cos(s.yaw);
     const wx = (ax * cs + az * sn) * tempo, wz = (-ax * sn + az * cs) * tempo;
@@ -338,7 +339,7 @@
     s.vx += (wx - s.vx) * k; s.vz += (wz - s.vz) * k;
 
     if (s.fliegen) {
-      const ziel = ((eing.spring ? 1 : 0) - (eing.runter ? 1 : 0)) * (eing.laufen ? 14 : 8);
+      const ziel = ((eing.spring ? 1 : 0) - (eing.runter ? 1 : 0)) * (renn ? 14 : 8);
       s.vy += (ziel - s.vy) * Math.min(1, 10 * dt);
     } else if (s.imWasser) {
       s.vy -= 12 * dt;
@@ -393,11 +394,28 @@
     const cp = Math.cos(spieler.pitch);
     return [-Math.sin(spieler.yaw) * cp, Math.sin(spieler.pitch), -Math.cos(spieler.yaw) * cp];
   }
+  // Touch: gezielt wird dorthin, wo der Finger liegt (nicht auf die Bildmitte)
+  let fingerXY = null, bauModus = false;
+  const _v = new THREE.Vector3();
+  function fingerRichtung() {
+    kamera.updateMatrixWorld();
+    _v.set((fingerXY[0] / window.innerWidth) * 2 - 1, -(fingerXY[1] / window.innerHeight) * 2 + 1, 0.5).unproject(kamera).sub(kamera.position).normalize();
+    return [_v.x, _v.y, _v.z];
+  }
   function zielen() {
-    const d = blickRichtung();
+    if (touch && !fingerXY) { ziel = null; markierung.visible = false; return; }
+    const d = touch ? fingerRichtung() : blickRichtung();
     ziel = strahl(spieler.x, spieler.y + AUGE, spieler.z, d[0], d[1], d[2], REICH);
-    if (ziel) { markierung.visible = true; markierung.position.set(ziel.x + 0.5, ziel.y + 0.5, ziel.z + 0.5); }
-    else markierung.visible = false;
+    if (!ziel) { markierung.visible = false; return; }
+    markierung.visible = true;
+    if (touch && bauModus) {
+      // Vorschau: dort, wo der neue Block hinkommt
+      markierung.position.set(ziel.x + ziel.nx + 0.5, ziel.y + ziel.ny + 0.5, ziel.z + ziel.nz + 0.5);
+      markierung.material.color.setHex(0xffffff); markierung.material.opacity = 0.95;
+    } else {
+      markierung.position.set(ziel.x + 0.5, ziel.y + 0.5, ziel.z + 0.5);
+      markierung.material.color.setHex(0x000000); markierung.material.opacity = 0.7;
+    }
   }
   function blockAendern(x, y, z, b) {
     setBlock(x, y, z, b);
@@ -405,20 +423,21 @@
   }
   function abbauen() {
     zielen();
-    if (!ziel || ziel.b === W.GRUND || ziel.y < 1) return;
+    if (!ziel || ziel.b === W.GRUND || ziel.y < 1) return false;
     blockAendern(ziel.x, ziel.y, ziel.z, 0);
+    return true;
   }
   function setzen() {
     zielen();
-    if (!ziel) return;
+    if (!ziel) return false;
     const x = ziel.x + ziel.nx, y = ziel.y + ziel.ny, z = ziel.z + ziel.nz;
-    if (y < 1 || y >= CH) return;
+    if (y < 1 || y >= CH) return false;
     const alt = getBlock(x, y, z);
-    if (alt !== 0 && alt !== W.WASSER) return;
+    if (alt !== 0 && alt !== W.WASSER) return false;
     // nicht in sich selbst bauen
-    const s = spieler;
-    if (x + 1 > s.x - BR && x < s.x + BR && y + 1 > s.y && y < s.y + HOCH && z + 1 > s.z - BR && z < s.z + BR) return;
+    if (spielerBlockUeberlappt(x, y, z)) { if (touch) meldung('Da stehst du selbst.'); return false; }
     blockAendern(x, y, z, hotbar[gewaehlt]);
+    return true;
   }
   function waehlen() {
     zielen();
@@ -438,10 +457,11 @@
       d.className = 'slot' + (i === gewaehlt ? ' an' : '');
       d.appendChild(symbolKopie(b));
       const z = document.createElement('i'); z.textContent = i + 1; d.appendChild(z);
-      d.addEventListener('pointerdown', e => { e.stopPropagation(); gewaehlt = i; hotbarZeichnen(); zeigeName(); });
+      d.addEventListener('pointerdown', e => { e.stopPropagation(); gewaehlt = i; hotbarZeichnen(); zeigeName(); if (touch) modusSetzen(true); });
       hotbarEl.appendChild(d);
     });
     ls.set('hotbar', hotbar.join(','));
+    if (touch) modusZeichnen();
   }
   function zeigeName() {
     const el = $('name');
@@ -729,54 +749,106 @@
   $('bInvZu').addEventListener('click', inventarUmschalten);
 
   /* ---------- Eingabe: Touch ---------- */
+  // Linke Seite: Joystick (weit nach aussen ziehen = rennen). Rechte Seite: wischen = umsehen,
+  // tippen = Aktion am getippten Block, gedrueckt halten = Aktion wiederholen.
+  // Ob die Aktion Abbauen oder Bauen ist, zeigt und wechselt der grosse Modus-Knopf.
   const tl = $('touch');
-  let stickId = null, stickX = 0, stickY = 0, blickId = null, blickX = 0, blickY = 0, blickBewegt = 0, blickStart = 0, haltTimer = 0, haltAusgeloest = false;
+  const SCHWELLE = 12;
+  let stickId = null, stickX = 0, stickY = 0, stickLaufen = false;
+  let blickId = null, blickX = 0, blickY = 0, blickBewegt = 0, blickStart = 0, umsehen = false, haltZeit = 0, aktionen = 0;
+  const vibriere = ms => { try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) { /* egal */ } };
+  function touchAktion() {
+    zielen();
+    const ok = bauModus ? setzen() : abbauen();
+    if (ok) { aktionen++; vibriere(bauModus ? 12 : 20); }
+    return ok;
+  }
   tl.addEventListener('pointerdown', e => {
     if (e.target !== tl || ueberlagerung || !spielLaeuft) return;
     try { tl.setPointerCapture(e.pointerId); } catch (err) { /* synthetische Ereignisse */ }
-    if (e.clientX < window.innerWidth * 0.45 && stickId === null) {
+    if (e.clientX < window.innerWidth * 0.42 && stickId === null) {
       stickId = e.pointerId; stickX = e.clientX; stickY = e.clientY;
       const b = $('stickBasis'); b.style.display = 'block'; b.style.left = stickX + 'px'; b.style.top = stickY + 'px';
       $('stickKnopf').style.transform = 'translate(0,0)';
     } else if (blickId === null) {
-      blickId = e.pointerId; blickX = e.clientX; blickY = e.clientY; blickBewegt = 0; blickStart = performance.now(); haltAusgeloest = false;
-      clearTimeout(haltTimer);
-      haltTimer = setTimeout(() => { if (blickId !== null && blickBewegt < 14) { haltAusgeloest = true; setzen(); if (navigator.vibrate) navigator.vibrate(15); } }, 380);
+      blickId = e.pointerId; blickX = e.clientX; blickY = e.clientY; blickBewegt = 0; blickStart = performance.now();
+      umsehen = false; haltZeit = 0; aktionen = 0;
+      fingerXY = [e.clientX, e.clientY];
     }
   });
   tl.addEventListener('pointermove', e => {
     if (e.pointerId === stickId) {
       let dx = e.clientX - stickX, dy = e.clientY - stickY;
       const l = Math.hypot(dx, dy), max = 55;
+      stickLaufen = l > max * 1.25;
       if (l > max) { dx = dx / l * max; dy = dy / l * max; }
       achse.x = dx / max; achse.z = dy / max;
       if (Math.hypot(achse.x, achse.z) < 0.15) { achse.x = 0; achse.z = 0; }
       $('stickKnopf').style.transform = `translate(${dx}px,${dy}px)`;
+      $('stickKnopf').classList.toggle('renn', stickLaufen);
     } else if (e.pointerId === blickId) {
       const dx = e.clientX - blickX, dy = e.clientY - blickY;
-      blickX = e.clientX; blickY = e.clientY; blickBewegt += Math.abs(dx) + Math.abs(dy);
-      spieler.yaw -= dx * 0.0062;
-      spieler.pitch = Math.max(-1.55, Math.min(1.55, spieler.pitch - dy * 0.0062));
+      blickBewegt += Math.abs(dx) + Math.abs(dy);
+      if (!umsehen && blickBewegt > SCHWELLE && aktionen === 0) {
+        // Ab hier ist es ein Wischen: nicht mehr zielen, sondern Kamera drehen
+        umsehen = true; fingerXY = null;
+      }
+      if (umsehen) {
+        spieler.yaw -= dx * 0.0062;
+        spieler.pitch = Math.max(-1.55, Math.min(1.55, spieler.pitch - dy * 0.0062));
+      } else if (aktionen > 0) {
+        fingerXY = [e.clientX, e.clientY];   // beim Halten mit dem Finger weiterziehen
+      }
+      blickX = e.clientX; blickY = e.clientY;
     }
   });
   const touchEnde = e => {
-    if (e.pointerId === stickId) { stickId = null; achse.x = 0; achse.z = 0; $('stickBasis').style.display = 'none'; }
-    else if (e.pointerId === blickId) {
-      clearTimeout(haltTimer);
-      if (blickBewegt < 14 && !haltAusgeloest && performance.now() - blickStart < 380) abbauen();
-      blickId = null;
+    if (e.pointerId === stickId) {
+      stickId = null; achse.x = 0; achse.z = 0; stickLaufen = false;
+      $('stickBasis').style.display = 'none'; $('stickKnopf').classList.remove('renn');
+    } else if (e.pointerId === blickId) {
+      if (!umsehen && aktionen === 0 && e.type === 'pointerup') touchAktion();
+      blickId = null; fingerXY = null; umsehen = false;
     }
   };
   tl.addEventListener('pointerup', touchEnde); tl.addEventListener('pointercancel', touchEnde);
+  // Wird jedes Bild aufgerufen: Gedrueckthalten wiederholt die Aktion
+  function touchHalten(dt) {
+    if (blickId === null || umsehen || !fingerXY) return;
+    if (performance.now() - blickStart < 320) return;
+    haltZeit -= dt;
+    if (haltZeit <= 0) { touchAktion(); haltZeit = bauModus ? 0.35 : 0.25; }
+  }
+
+  function modusZeichnen() {
+    const el = $('tModus');
+    el.innerHTML = '';
+    if (bauModus) el.appendChild(symbolKopie(hotbar[gewaehlt]));
+    else { const sp = document.createElement('span'); sp.textContent = '⛏'; sp.className = 'ico'; el.appendChild(sp); }
+    const t = document.createElement('small'); t.textContent = bauModus ? 'Bauen' : 'Abbauen'; el.appendChild(t);
+    el.classList.toggle('bau', bauModus);
+  }
+  function modusSetzen(an) { bauModus = an; modusZeichnen(); }
   const knopf = (id, ab, auf) => {
     const el = $(id);
-    el.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); ab(); });
-    if (auf) { el.addEventListener('pointerup', e => { e.stopPropagation(); auf(); }); el.addEventListener('pointercancel', () => auf()); el.addEventListener('pointerleave', () => auf()); }
+    el.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); try { el.setPointerCapture(e.pointerId); } catch (err) { /* egal */ } ab(); });
+    if (auf) { el.addEventListener('pointerup', e => { e.stopPropagation(); auf(); }); el.addEventListener('pointercancel', () => auf()); el.addEventListener('lostpointercapture', () => auf()); }
   };
-  knopf('tSpringen', () => taste({ code: 'Space' }, true), () => taste({ code: 'Space' }, false));
+  knopf('tSpringen', () => { eing.spring = true; }, () => { eing.spring = false; });
+  knopf('tRunter', () => { eing.runter = true; }, () => { eing.runter = false; });
+  knopf('tModus', () => { modusSetzen(!bauModus); vibriere(8); });
+  knopf('tFlug', () => { spieler.fliegen = !spieler.fliegen; spieler.vy = 0; meldung(spieler.fliegen ? 'Flugmodus an: ▲ hoch, ▼ runter' : 'Flugmodus aus'); flugKnoepfe(); });
   knopf('tMenue', () => pauseZeigen());
   knopf('tInv', () => inventarUmschalten());
   knopf('tChat', () => chatOeffnen());
+  let flugAnzeige = null;
+  function flugKnoepfe() {
+    if (flugAnzeige === spieler.fliegen) return;
+    flugAnzeige = spieler.fliegen;
+    $('tRunter').style.display = spieler.fliegen ? 'grid' : 'none';
+    $('tSpringen').textContent = spieler.fliegen ? '▲' : 'Sprung';
+    $('tFlug').classList.toggle('an', spieler.fliegen);
+  }
 
   /* ---------- Menues ---------- */
   function setzeVollbildTeile(an) {
@@ -792,7 +864,8 @@
     $('sicht2').value = String(sicht);
     $('pause').classList.add('offen');
     for (const k in eing) eing[k] = false;
-    achse.x = achse.z = 0;
+    achse.x = achse.z = 0; fingerXY = null; blickId = null; stickId = null; stickLaufen = false;
+    $('stickBasis').style.display = 'none';
     sicherSolo(); sichereOnline();
   }
   function pauseSchliessen() {
@@ -836,6 +909,7 @@
     sichtSetzen(sicht);
     hotbarZeichnen(); zeigeName();
     setzeVollbildTeile(true);
+    if (touch) { modusSetzen(false); flugAnzeige = null; }
     letzterChunkX = 1e9;
     // Startposition: erst die Welt rund um den Startpunkt erzeugen
     let p = daten.pos || startPosition();
@@ -853,6 +927,7 @@
   $('spielerName').value = ls.get('name', '');
   $('sicht').value = String(sicht);
   if (![...$('sicht').options].some(o => o.value === String(sicht))) { sicht = touch ? 4 : 8; $('sicht').value = String(sicht); }
+  if (touch) document.body.classList.add('touch');
   $('hilfeDesktop').style.display = touch ? 'none' : 'block';
   $('hilfeTouch').style.display = touch ? 'block' : 'none';
   inventarBauen();
@@ -930,6 +1005,7 @@
     if (!ueberlagerung) {
       zielen();
       if (mausLinks) { mausZeit -= dt; if (mausZeit <= 0) { abbauen(); mausZeit = 0.2; } }
+      if (touch) { touchHalten(dt); flugKnoepfe(); }
     }
     // Unter Wasser: dunkler blauer Nebel
     const unterWasser = getBlock(Math.floor(spieler.x), Math.floor(spieler.y + AUGE), Math.floor(spieler.z)) === W.WASSER;
@@ -956,5 +1032,5 @@
   document.addEventListener('visibilitychange', () => { if (document.hidden) { sicherSolo(); sichereOnline(); } });
 
   // Fuer Tests
-  window.quaderland = { W, getBlock, setBlock, spieler, chunks, get ziel() { return ziel; }, kamera, szene, renderer, meshArbeit, chunksAktualisieren, abbauen, setzen, hotbar, andere, get ws() { return ws; } };
+  window.quaderland = { get aenderungen() { return aenderungFlach().length / 4; }, get bauModus() { return bauModus; }, W, getBlock, setBlock, spieler, chunks, get ziel() { return ziel; }, kamera, szene, renderer, meshArbeit, chunksAktualisieren, abbauen, setzen, hotbar, andere, get ws() { return ws; } };
 })();
