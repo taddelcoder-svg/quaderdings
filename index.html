@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#0f1a2b">
+<title>Quaderland</title>
+<style>
+  :root{--bg:#0f1a2b;--karte:#18263b;--rand:#33496a;--text:#eef3fa;--leise:#9fb2cc;--akzent:#5fc16a;--akzent2:#3d9a4a;--warn:#ffb347}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;user-select:none;-webkit-user-select:none;touch-action:none}
+  canvas#c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  .voll{position:fixed;inset:0;display:none}
+  #hud{pointer-events:none}
+  #faden{position:fixed;left:50%;top:50%;width:22px;height:22px;margin:-11px 0 0 -11px}
+  #faden:before,#faden:after{content:"";position:absolute;background:rgba(255,255,255,.85);mix-blend-mode:difference}
+  #faden:before{left:10px;top:0;width:2px;height:22px}
+  #faden:after{top:10px;left:0;height:2px;width:22px}
+  #hotbar{position:fixed;left:50%;bottom:calc(10px + env(safe-area-inset-bottom));transform:translateX(-50%);display:flex;gap:4px;padding:4px;background:rgba(10,16,28,.55);border:2px solid rgba(255,255,255,.25);border-radius:8px;pointer-events:auto}
+  .slot{width:46px;height:46px;border-radius:5px;border:2px solid transparent;background:rgba(255,255,255,.08);display:grid;place-items:center;position:relative;cursor:pointer}
+  .slot.an{border-color:#fff;background:rgba(255,255,255,.2)}
+  .slot canvas{width:36px;height:36px;image-rendering:pixelated}
+  .slot i{position:absolute;left:3px;top:0;font:700 10px/14px system-ui;color:rgba(255,255,255,.75);font-style:normal}
+  #info{position:fixed;left:8px;top:8px;font:12px/1.4 ui-monospace,Consolas,monospace;color:#fff;text-shadow:0 1px 2px #000;display:none;white-space:pre}
+  #name{position:fixed;left:50%;bottom:calc(72px + env(safe-area-inset-bottom));transform:translateX(-50%);font-weight:700;text-shadow:0 1px 3px #000;opacity:0;transition:opacity .4s}
+  #chatlog{position:fixed;left:8px;bottom:calc(76px + env(safe-area-inset-bottom));max-width:min(520px,70vw);font-size:14px;text-shadow:0 1px 2px #000;pointer-events:none}
+  #chatlog div{background:rgba(0,0,0,.4);padding:2px 8px;margin-top:2px;border-radius:4px;transition:opacity 1s}
+  #chatlog b{color:#9fd8ff}
+  #chatlog .sys{color:var(--warn)}
+  #chateingabe{position:fixed;left:8px;right:8px;bottom:calc(76px + env(safe-area-inset-bottom));max-width:520px;display:none;padding:8px 10px;border-radius:6px;border:2px solid var(--rand);background:rgba(10,16,28,.9);color:#fff;font:inherit;user-select:text;-webkit-user-select:text}
+  #liste{position:fixed;left:50%;top:40px;transform:translateX(-50%);min-width:220px;background:rgba(10,16,28,.8);border:1px solid var(--rand);border-radius:8px;padding:10px 14px;display:none}
+  #liste h3{margin:0 0 6px;font-size:14px;color:var(--leise)}
+  #toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:rgba(10,16,28,.85);border:1px solid var(--rand);padding:8px 14px;border-radius:8px;opacity:0;transition:opacity .3s;pointer-events:none;text-align:center;max-width:90vw}
+  .overlay{position:fixed;inset:0;display:none;place-items:center;padding:16px;background:rgba(8,12,22,.72);backdrop-filter:blur(3px);overflow:auto;touch-action:pan-y}
+  .overlay.offen{display:grid}
+  #menue{background:linear-gradient(180deg,#78c4ef 0%,#b6e1f7 45%,#5fa84e 45.1%,#3f7f36 100%)}
+  .kasten{width:100%;max-width:440px;background:var(--karte);border:1px solid var(--rand);border-radius:14px;padding:22px;box-shadow:0 18px 50px rgba(0,0,0,.5)}
+  h1{margin:0;font-size:2.2rem;letter-spacing:.5px;line-height:1.1}
+  h1 span{color:var(--akzent)}
+  .unter{margin:4px 0 16px;color:var(--leise)}
+  label{display:block;margin:12px 0 4px;color:var(--leise);font-size:14px}
+  input[type=text],select{width:100%;font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--rand);background:var(--bg);color:var(--text);user-select:text;-webkit-user-select:text}
+  button.gross{width:100%;font:inherit;font-weight:700;padding:12px;margin-top:10px;border-radius:9px;border:0;background:var(--akzent);color:#0b2a10;cursor:pointer}
+  button.gross:hover{background:#74d37e}
+  button.gross.zweit{background:#2b3f5e;color:var(--text)}
+  button.gross.zweit:hover{background:#38527a}
+  button:disabled{opacity:.5;cursor:default}
+  .hilfe{margin-top:16px;font-size:13px;color:var(--leise);line-height:1.6}
+  .hilfe b{color:var(--text)}
+  .fehler{color:#ff8a80;margin:10px 0 0;min-height:1.2em}
+  .klein{font-size:12px;color:var(--leise);margin-top:12px}
+  .klein a{color:var(--akzent)}
+  #inventar .kasten{max-width:560px}
+  #raster{display:grid;grid-template-columns:repeat(auto-fill,minmax(56px,1fr));gap:6px;margin-top:12px}
+  #raster .slot{width:auto;height:56px}
+  #raster .slot canvas{width:44px;height:44px}
+  #touch{position:fixed;inset:0;display:none;touch-action:none}
+  #touch.an{display:block}
+  .tk{position:fixed;width:58px;height:58px;border-radius:50%;background:rgba(255,255,255,.18);border:2px solid rgba(255,255,255,.4);color:#fff;font:700 13px system-ui;display:grid;place-items:center;pointer-events:auto;touch-action:none}
+  .tk:active{background:rgba(255,255,255,.4)}
+  #tSpringen{right:calc(18px + env(safe-area-inset-right));bottom:calc(86px + env(safe-area-inset-bottom));width:70px;height:70px}
+  #tMenue{right:calc(10px + env(safe-area-inset-right));top:10px;width:44px;height:44px}
+  #tInv{right:calc(64px + env(safe-area-inset-right));top:10px;width:44px;height:44px}
+  #tChat{right:calc(118px + env(safe-area-inset-right));top:10px;width:44px;height:44px}
+  #stickBasis{position:fixed;width:120px;height:120px;margin:-60px 0 0 -60px;border-radius:50%;background:rgba(255,255,255,.12);border:2px solid rgba(255,255,255,.3);display:none;pointer-events:none}
+  #stickKnopf{position:absolute;left:50%;top:50%;width:52px;height:52px;margin:-26px 0 0 -26px;border-radius:50%;background:rgba(255,255,255,.4)}
+  @media (max-width:520px){.slot{width:38px;height:38px}.slot canvas{width:30px;height:30px}#hotbar{gap:2px}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud" class="voll">
+  <div id="faden"></div>
+  <div id="info"></div>
+  <div id="name"></div>
+  <div id="chatlog"></div>
+  <div id="liste"><h3>Spieler</h3><div id="listeInhalt"></div></div>
+  <div id="toast"></div>
+</div>
+<div id="hotbar" style="display:none"></div>
+<input id="chateingabe" type="text" maxlength="140" autocomplete="off" placeholder="Nachricht … (Enter zum Senden)">
+
+<div id="touch">
+  <div id="stickBasis"><div id="stickKnopf"></div></div>
+  <div class="tk" id="tSpringen">Sprung</div>
+  <div class="tk" id="tMenue">II</div>
+  <div class="tk" id="tInv">▦</div>
+  <div class="tk" id="tChat">💬</div>
+</div>
+
+<div id="menue" class="overlay offen">
+  <div class="kasten">
+    <h1>Quader<span>land</span></h1>
+    <p class="unter">Bauen, graben, entdecken – allein oder zusammen.</p>
+    <label for="spielerName">Dein Name (für Online)</label>
+    <input id="spielerName" type="text" maxlength="14" placeholder="z. B. Löwe" autocomplete="off">
+    <label for="sicht">Sichtweite</label>
+    <select id="sicht">
+      <option value="4">Nah (schnell)</option>
+      <option value="6">Mittel</option>
+      <option value="8">Weit</option>
+      <option value="11">Sehr weit</option>
+    </select>
+    <button class="gross" id="bOnline">Online-Welt betreten</button>
+    <button class="gross zweit" id="bSolo">Alleine spielen</button>
+    <button class="gross zweit" id="bNeu" style="display:none">Neue Einzelwelt anlegen</button>
+    <p class="fehler" id="fehler" role="alert"></p>
+    <div class="hilfe" id="hilfeDesktop">
+      <b>W A S D</b> laufen · <b>Leertaste</b> springen (2× = Fliegen) · <b>Shift</b> rennen / im Flug runter<br>
+      <b>Linksklick</b> abbauen · <b>Rechtsklick</b> setzen · <b>1–9 / Mausrad</b> Block wählen<br>
+      <b>E</b> Inventar · <b>T</b> Chat · <b>Tab</b> Spielerliste · <b>F3</b> Infos
+    </div>
+    <div class="hilfe" id="hilfeTouch" style="display:none">
+      <b>Linker Daumen</b> laufen · <b>rechts wischen</b> umsehen · <b>kurz tippen</b> abbauen · <b>gedrückt halten</b> setzen<br>
+      <b>Sprung</b> zweimal tippen = Fliegen
+    </div>
+    <p class="klein">Privates Hobbyprojekt für Familie und Freunde · <a href="/datenschutz">Datenschutz</a></p>
+  </div>
+</div>
+
+<div id="pause" class="overlay">
+  <div class="kasten">
+    <h1>Pause</h1>
+    <p class="unter" id="pauseText"></p>
+    <button class="gross" id="bWeiter">Weiter spielen</button>
+    <label for="sicht2">Sichtweite</label>
+    <select id="sicht2">
+      <option value="4">Nah (schnell)</option>
+      <option value="6">Mittel</option>
+      <option value="8">Weit</option>
+      <option value="11">Sehr weit</option>
+    </select>
+    <button class="gross zweit" id="bMenue">Zum Hauptmenü</button>
+  </div>
+</div>
+
+<div id="inventar" class="overlay">
+  <div class="kasten">
+    <h1 style="font-size:1.5rem">Blöcke</h1>
+    <p class="unter" style="margin-bottom:0">Klicke einen Block, um ihn in den ausgewählten Hotbar-Platz zu legen.</p>
+    <div id="raster"></div>
+    <button class="gross zweit" id="bInvZu">Schließen (E)</button>
+  </div>
+</div>
+
+<script src="/vendor/three.min.js"></script>
+<script src="/welt.js"></script>
+<script src="/texturen.js"></script>
+<script src="/spiel.js"></script>
+</body>
+</html>
