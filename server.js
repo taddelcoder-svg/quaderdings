@@ -2,11 +2,13 @@
 // Quaderland - Server: liefert das Spiel aus und haelt die gemeinsame Online-Welt (WebSocket unter /ws).
 // Die Welt selbst entsteht aus einer Zahl (seed) im Browser. Der Server merkt sich nur,
 // welche Bloecke Spieler veraendert haben, und verteilt Positionen, Bloecke und Chat.
+// Tiere und Zombies rechnet der Server selbst (tiere.js), damit alle dieselben sehen.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 const Welt = require('./welt');
+const Tiere = require('./tiere');
 const zugang = require('./zugang')({ titel: 'Quaderland' });
 
 const PORT = Number(process.env.PORT) || 10900;
@@ -23,7 +25,7 @@ const TYPEN = {
 };
 const DATEIEN = new Map([
   ['/', 'index.html'], ['/index.html', 'index.html'], ['/spiel.js', 'spiel.js'], ['/welt.js', 'welt.js'],
-  ['/texturen.js', 'texturen.js'], ['/datenschutz', 'datenschutz.html'], ['/datenschutz.html', 'datenschutz.html']
+  ['/texturen.js', 'texturen.js'], ['/dinge.js', 'dinge.js'], ['/tiere.js', 'tiere.js'], ['/datenschutz', 'datenschutz.html'], ['/datenschutz.html', 'datenschutz.html']
 ]);
 
 function senden(res, datei, cache) {
@@ -80,6 +82,24 @@ function speichern() {
 setInterval(speichern, 20_000).unref();
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { speichern(); process.exit(0); });
 
+/* ---------- Welt-Zugriff fuer Tiere ---------- */
+const chunkSpeicher = new Map();
+function getBlock(x, y, z) {
+  if (y < 0) return Welt.GRUND;
+  if (y >= Welt.CH) return 0;
+  const a = aenderungen.get(x + ',' + y + ',' + z);
+  if (a !== undefined) return a;
+  const cx = x >> 4, cz = z >> 4, k = cx + ',' + cz;
+  let d = chunkSpeicher.get(k);
+  if (!d) {
+    if (chunkSpeicher.size > 600) chunkSpeicher.delete(chunkSpeicher.keys().next().value);
+    d = Welt.chunkErzeugen(seed, cx, cz);
+    chunkSpeicher.set(k, d);
+  }
+  return d[(x & 15) + (z & 15) * 16 + y * 256];
+}
+let tiere = new Tiere(getBlock);
+
 /* ---------- Spieler ---------- */
 const spieler = new Map();
 let naechsteId = 1;
@@ -100,7 +120,7 @@ function saeubern(name) {
 wss.on('connection', ws => {
   if (spieler.size >= MAX_SPIELER) { sende(ws, { t: 'fehler', text: 'Die Welt ist voll (' + MAX_SPIELER + ' Spieler).' }); return ws.close(); }
   const id = naechsteId++;
-  const sp = { id, ws, name: 'Spieler', x: 0, y: 40, z: 0, ry: 0, rp: 0, neuePos: false, tokenB: 30, letzterChat: 0, drin: false };
+  const sp = { id, ws, name: 'Spieler', x: 0, y: 40, z: 0, ry: 0, rp: 0, neuePos: false, tokenB: 30, letzterChat: 0, drin: false, ueberleben: false, lebend: true, letzterHieb: 0 };
   const tokenTimer = setInterval(() => { sp.tokenB = Math.min(40, sp.tokenB + 20); }, 1000);
 
   ws.on('message', roh => {
@@ -140,6 +160,17 @@ wss.on('connection', ws => {
       aenderungen.set(m.x + ',' + m.y + ',' + m.z, m.b);
       neu = false; veraendert = true;
       anAlle({ t: 'block', x: m.x, y: m.y, z: m.z, b: m.b }, ws);
+    } else if (m.t === 'zustand') {
+      sp.ueberleben = m.u === true; sp.lebend = m.l !== false;
+    } else if (m.t === 'hau') {
+      // Spieler haut ein Tier: Abstand und Takt pruefen, Beute nur an ihn
+      const j = Date.now();
+      if (!ganz(m.id) || !ganz(m.s) || m.s < 1 || m.s > 8 || j - sp.letzterHieb < 250) return;
+      const t = tiere.m.get(m.id);
+      if (!t || (t.x - sp.x) ** 2 + (t.y - sp.y) ** 2 + (t.z - sp.z) ** 2 > 7 * 7) return;
+      sp.letzterHieb = j;
+      const erg = tiere.hau(m.id, m.s, sp.x, sp.z);
+      if (erg && erg.beute.length) sende(ws, { t: 'beute', l: erg.beute });
     } else if (m.t === 'chat') {
       const j = Date.now();
       if (j - sp.letzterChat < 600) return;
@@ -158,7 +189,7 @@ wss.on('connection', ws => {
         if (Math.abs(x) > GRENZE || Math.abs(z) > GRENZE) return;
         neue.set(x + ',' + y + ',' + z, b);
       }
-      seed = m.seed; aenderungen.clear();
+      seed = m.seed; aenderungen.clear(); chunkSpeicher.clear(); tiere = new Tiere(getBlock);
       for (const [k, b] of neue) aenderungen.set(k, b);
       neu = false; veraendert = true;
       anAlle({ t: 'welt', seed, a: flach() });
@@ -177,6 +208,21 @@ setInterval(() => {
   const l = [];
   for (const sp of spieler.values()) if (sp.neuePos) { sp.neuePos = false; l.push([sp.id, +sp.x.toFixed(2), +sp.y.toFixed(2), +sp.z.toFixed(2), +sp.ry.toFixed(2), +sp.rp.toFixed(2)]); }
   if (l.length) anAlle({ t: 'p', l });
+}, 100).unref();
+
+// Tiere: 10-mal pro Sekunde rechnen und verteilen (nur wenn jemand online ist)
+let letzterTierTakt = Date.now();
+setInterval(() => {
+  const j = Date.now(), dt = Math.min(0.2, (j - letzterTierTakt) / 1000);
+  letzterTierTakt = j;
+  if (!spieler.size) { if (tiere.m.size) tiere.m.clear(); return; }
+  const liste = [...spieler.values()].map(p => ({ id: p.id, x: p.x, y: p.y, z: p.z, ueberleben: p.ueberleben, lebend: p.lebend }));
+  const tag = Welt.tageslicht(Welt.phaseAusZeit(j));
+  for (const e of tiere.schritt(dt, liste, tag)) {
+    const p = spieler.get(e.ziel);
+    if (p) sende(p.ws, { t: 'schaden', s: e.s, x: +e.x.toFixed(2), z: +e.z.toFixed(2) });
+  }
+  anAlle({ t: 'tiere', l: tiere.liste() });
 }, 100).unref();
 
 server.listen(PORT, () => console.log('Quaderland laeuft auf Port ' + PORT));
