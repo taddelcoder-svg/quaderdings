@@ -5,7 +5,8 @@
   "description": "Quaderland – Voxel-Bauspiel im Browser mit gemeinsamer Online-Welt",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/olympia.test.js"
   },
   "engines": {
     "node": ">=18"

@@ -10,6 +10,8 @@ const { WebSocketServer } = require('ws');
 const Welt = require('./welt');
 const Tiere = require('./tiere');
 const zugang = require('./zugang')({ titel: 'Quaderland' });
+const olymp = require('./olymp')({ spiel: 'quaderland' });
+const Olympia = require('./olympia');
 
 const PORT = Number(process.env.PORT) || 10900;
 const DATEN = process.env.DATEN_VERZEICHNIS || path.join(__dirname, 'daten');
@@ -21,11 +23,12 @@ const GRENZE = 200_000;
 
 const TYPEN = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.txt': 'text/plain; charset=utf-8'
+  '.css': 'text/css; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.woff2': 'font/woff2'
 };
 const DATEIEN = new Map([
   ['/', 'index.html'], ['/index.html', 'index.html'], ['/spiel.js', 'spiel.js'], ['/welt.js', 'welt.js'],
-  ['/texturen.js', 'texturen.js'], ['/dinge.js', 'dinge.js'], ['/tiere.js', 'tiere.js'], ['/datenschutz', 'datenschutz.html'], ['/datenschutz.html', 'datenschutz.html']
+  ['/texturen.js', 'texturen.js'], ['/dinge.js', 'dinge.js'], ['/tiere.js', 'tiere.js'], ['/olympia.js', 'olympia.js'],
+  ['/fonts/bricolage-grotesque.woff2', 'fonts/bricolage-grotesque.woff2'], ['/fonts/OFL-Bricolage.txt', 'fonts/OFL-Bricolage.txt'], ['/datenschutz', 'datenschutz.html'], ['/datenschutz.html', 'datenschutz.html']
 ]);
 
 function senden(res, datei, cache) {
@@ -35,6 +38,52 @@ function senden(res, datei, cache) {
   fs.createReadStream(voll).pipe(res);
 }
 
+/* ---------- Olympiade: Sammel-Wettlauf (eigener Modus, beruehrt die Online-Welt nicht) ----------
+   Der Browser spielt allein einen Versuch in einer festen Welt (Seed aus der Lauf-Kennung) und meldet
+   hier "bin da", "Start" und am Ende seine rohen Zahlen. Die Punkte rechnet der Server (olympia.js)
+   und gibt sie an die Olympiade weiter. Pro Ticket zaehlt nur die erste Meldung. */
+const olympStand = new Map();   // "lauf:spieler" -> { da, start, fertig: {punkte, text}, zeit }
+setInterval(() => {
+  const j = Date.now();
+  for (const [k, e] of olympStand) if (j - e.zeit > 12 * 3600_000) olympStand.delete(k);
+}, 600_000).unref();
+
+function olympAnfrage(req, res) {
+  let d = '';
+  req.on('data', c => { d += c; if (d.length > 8000) req.destroy(); });
+  req.on('end', () => {
+    const antwort = (status, daten) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(daten)); };
+    let m;
+    try { m = JSON.parse(d); } catch (e) { return antwort(400, { fehler: 'Anfrage kaputt' }); }
+    const t = olymp.ticketPruefen(m && m.ticket);
+    if (!t) return antwort(403, { fehler: 'Das Olympia-Ticket ist ungültig oder abgelaufen. Hol dir in der Olympiade ein neues.' });
+    const schluessel = t.l + ':' + t.s;
+    let st = olympStand.get(schluessel);
+    if (!st) { st = { da: 0, start: 0, fertig: null, zeit: Date.now() }; olympStand.set(schluessel, st); }
+    const minuten = Olympia.dauerMinuten(t.c);
+    if (m.art === 'info') {
+      return antwort(200, { ok: true, info: olymp.fuerBrowser(t), minuten, seed: Olympia.seedAus(t.l), gestartet: !!st.start, ergebnis: st.fertig });
+    }
+    if (m.art === 'da') {
+      if (!st.fertig && Date.now() - st.da > 20_000) { st.da = Date.now(); olymp.da(t, t.s); }
+      return antwort(200, { ok: true, schonGespielt: !!st.fertig });
+    }
+    if (m.art === 'start') {
+      if (st.fertig) return antwort(409, { fehler: 'Dein Versuch ist schon gewertet.', ...st.fertig });
+      if (!st.start) st.start = Date.now();
+      return antwort(200, { ok: true, rest: Math.max(0, minuten * 60 - (Date.now() - st.start) / 1000) });
+    }
+    if (m.art !== 'ergebnis' || !m.gesammelt || typeof m.gesammelt !== 'object') return antwort(400, { fehler: 'Meldung unvollständig' });
+    if (st.fertig) return antwort(409, { fehler: 'Dein Versuch ist schon gewertet.', ...st.fertig });
+    // Hoechstens so lange kann gespielt worden sein: seit dem gemeldeten Start, nie mehr als die Spielzeit
+    const gespielt = st.start ? Math.min(minuten * 60, (Date.now() - st.start) / 1000) : minuten * 60;
+    const w = Olympia.punkte(m.gesammelt, gespielt);
+    st.fertig = { punkte: w.punkte, text: w.text };
+    olymp.wertMelden(t, t.s, w.punkte, w.text);
+    antwort(200, { ok: true, punkte: w.punkte, text: w.text });
+  });
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname.startsWith('/datenschutz')) return senden(res, 'datenschutz.html', 'no-cache');
@@ -42,6 +91,8 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end('{"ok":true}');
   }
   if (url.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
+  // Olympia-Meldungen sind durch das signierte Ticket geschuetzt, nicht durch das Passwort-Cookie
+  if (req.method === 'POST' && url.pathname === '/api/olymp') return olympAnfrage(req, res);
   if (zugang.pruefen(req, res)) return;
   if (req.method === 'GET' && url.pathname === '/vendor/three.min.js') return senden(res, 'vendor/three.min.js', 'public, max-age=604800');
   if (req.method === 'GET' && DATEIEN.has(url.pathname)) return senden(res, DATEIEN.get(url.pathname), 'no-cache');

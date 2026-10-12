@@ -871,11 +871,11 @@
   }
 
   /* ---------- Abbauen, Setzen, Hauen, Essen ---------- */
-  function beuteEinsammeln(liste) {
+  function beuteEinsammeln(liste, ohnePunkte) {
     if (!ueberleben()) return;
     for (const [id, n] of liste) {
       const rest = inv.hinzu(id, n);
-      if (rest < n) meldungKlein('+' + (n - rest) + ' ' + name(id));
+      if (rest < n) { meldungKlein('+' + (n - rest) + ' ' + name(id)); if (!ohnePunkte) olympGesammelt(id, n - rest); }
       if (rest > 0) meldung('Dein Inventar ist voll.');
     }
     hotbarZeichnen();
@@ -887,17 +887,19 @@
     const l = lichtBei(x, y + 1, z);
     partikelSpruehen(x, y, z, b, Math.max(0.15, Math.pow(0.8, 15 - Math.max(l[0] * uniforms.tag.value, l[1]))));
     blockAendern(x, y, z, 0);
+    const eigener = olympEigenerBlock(x, y, z, true);   // Olympiade: selbst gesetzte Bloecke bringen keine Punkte
     if (ueberleben()) {
       const a = D.abbau(b, inHand());
-      beuteEinsammeln(D.beute(b, a.ernte));
+      beuteEinsammeln(D.beute(b, a.ernte), eigener);
       const w = D.werkzeug(inHand());
       if (w && W.TAB[b][6] > 0 && w.typ !== 'w') { if (inv.abnutzen(gewaehlt)) meldung('Dein Werkzeug ist zerbrochen.'); hotbarZeichnen(); }
     }
     // Pflanzen und Fackeln obendrauf fallen mit
     const oben = getBlock(x, y + 1, z);
     if (W.BRAUCHT_BODEN[oben]) {
+      const eigenerOben = olympEigenerBlock(x, y + 1, z, true);
       blockAendern(x, y + 1, z, 0);
-      if (ueberleben()) beuteEinsammeln(D.beute(oben, true));
+      if (ueberleben()) beuteEinsammeln(D.beute(oben, true), eigenerOben);
     }
     return true;
   }
@@ -970,6 +972,7 @@
     }
     if (alt && PFLANZE[alt] && ueberleben()) beuteEinsammeln(D.beute(alt, true));
     blockAendern(x, y, z, hand);
+    olympEigenerBlock(x, y, z, false, true);
     if (ueberleben()) { inv.nimm(gewaehlt, 1); hotbarZeichnen(); }
     return true;
   }
@@ -1211,6 +1214,7 @@
     const el = $('listeInhalt'); el.innerHTML = '';
     const namen = [ls.get('name', 'Du') + ' (du)', ...[...andere.values()].map(a => a.name)];
     for (const n of namen) { const d = document.createElement('div'); d.textContent = n; el.appendChild(d); }
+    chipsZeichnen();
   }
 
   /* ---------- Netzwerk ---------- */
@@ -1533,8 +1537,31 @@
   }
 
   /* ---------- Menues ---------- */
+  function chipsZeichnen() {
+    const m = $('chipModus'), o = $('chipOnline');
+    if (modus === 'olymp') m.textContent = '🏅 Olympiade';
+    else m.textContent = ueberleben() ? '⛏ Überleben' : '✨ Kreativ';
+    o.hidden = modus !== 'online';
+    if (modus === 'online') o.textContent = '🌐 Online · ' + (andere.size + 1) + ' Spieler';
+  }
+  // Auswahl-Kacheln (.seg) steuern die versteckten Auswahllisten und zeigen deren Wert
+  function segSync() {
+    document.querySelectorAll('.seg[data-fuer]').forEach(seg => {
+      const v = $(seg.dataset.fuer).value;
+      seg.querySelectorAll('button').forEach(b => { const an = b.dataset.wert === v; b.classList.toggle('an', an); b.setAttribute('aria-checked', an ? 'true' : 'false'); });
+    });
+  }
+  document.addEventListener('click', e => {
+    const b = e.target.closest && e.target.closest('.seg[data-fuer] button');
+    if (!b) return;
+    const sel = $(b.closest('.seg').dataset.fuer);
+    sel.value = b.dataset.wert;
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    segSync();
+  });
   function setzeVollbildTeile(an) {
     $('hud').style.display = an ? 'block' : 'none';
+    chipsZeichnen();
     $('hotbar').style.display = an ? 'flex' : 'none';
     $('touch').classList.toggle('an', an && touch);
     $('tChat').style.display = modus === 'online' ? 'grid' : 'none';
@@ -1545,9 +1572,12 @@
     if (!spielLaeuft || ueberlagerung) return;
     ueberlagerung = true;
     abbauStop(); mausLinks = false;
-    $('pauseText').textContent = modus === 'online' ? 'Du bist online. Die Welt läuft für alle weiter.' : 'Deine Einzelwelt wird automatisch gespeichert.';
+    $('pauseText').textContent = modus === 'online' ? 'Du bist online. Die Welt läuft für alle weiter.' : modus === 'olymp' ? 'Die Olympia-Uhr läuft weiter!' : 'Deine Einzelwelt wird automatisch gespeichert.';
     $('sicht2').value = String(sicht);
     $('spielmodus2').value = spielmodus;
+    for (const id of ['pauseModus', 'bMenue']) $(id).hidden = modus === 'olymp';
+    document.querySelector('.seg[data-fuer="spielmodus2"]').hidden = modus === 'olymp';
+    segSync();
     $('pause').classList.add('offen');
     for (const k in eing) eing[k] = false;
     achse.x = achse.z = 0; fingerXY = null; blickId = null; stickId = null; stickLaufen = false;
@@ -1560,13 +1590,14 @@
   }
   $('bWeiter').addEventListener('click', pauseSchliessen);
   $('bMenue').addEventListener('click', () => zumMenue(''));
-  function sichtSetzen(v) { sicht = Number(v) || 6; ls.set('sicht', sicht); letzterChunkX = 1e9; }
+  function sichtSetzen(v) { sicht = Number(v) || 6; ls.set('sicht', sicht); letzterChunkX = 1e9; segSync(); }
   $('sicht2').addEventListener('change', e => { sichtSetzen(e.target.value); $('sicht').value = String(sicht); });
   $('sicht').addEventListener('change', e => { sichtSetzen(e.target.value); });
   function spielmodusSetzen(m) {
     spielmodus = m === 'ueberleben' ? 'ueberleben' : 'kreativ';
     ls.set('spielmodus', spielmodus);
     $('spielmodus').value = spielmodus; $('spielmodus2').value = spielmodus;
+    segSync(); chipsZeichnen();
     if (spielLaeuft) {
       if (ueberleben()) spieler.fliegen = false;
       leben.tot = false;
@@ -1640,6 +1671,7 @@
   if (touch) document.body.classList.add('touch');
   $('hilfeDesktop').style.display = touch ? 'none' : 'block';
   $('hilfeTouch').style.display = touch ? 'block' : 'none';
+  segSync();
 
   $('bSolo').addEventListener('click', () => {
     ls.set('name', $('spielerName').value.trim());
@@ -1692,6 +1724,138 @@
   });
   menueAktualisieren();
 
+  /* ---------- Olympiade: Sammel-Wettlauf (nur mit ?olymp=Ticket, eigener Modus 'olymp') ----------
+     Alle Spieler bekommen dieselbe Welt (Seed vom Server aus der Lauf-Kennung), sammeln begrenzte Zeit
+     lang Rohstoffe und melden am Ende nur die rohen Mengen. Die Punkte rechnet der Server (olympia.js).
+     Ohne Ticket bleibt dieser Teil unbenutzt. Einzelwelt und Online-Welt werden nicht angefasst. */
+  const O = Olympia;
+  const olympia = (() => {
+    let ticket = new URLSearchParams(location.search).get('olymp');
+    try { if (ticket) sessionStorage.setItem('quaderland-olymp', ticket); else ticket = sessionStorage.getItem('quaderland-olymp'); } catch (e) { /* egal */ }
+    return ticket ? { ticket, info: null, minuten: 5, seed: 0, laeuft: false, ende: 0, gesammelt: {}, gesetzt: new Set(), key: '', hudZeit: 0, speicherZeit: 0 } : null;
+  })();
+  function olympGesammelt(id, n) {
+    if (!olympia || !olympia.laeuft || !O.WERT[id]) return;
+    olympia.gesammelt[id] = (olympia.gesammelt[id] || 0) + n;
+    olympSpeichern(); olympHud();
+  }
+  // Selbst gesetzte Bloecke merken (bringen beim Abbauen keine Punkte). Liefert, ob der Block selbst gesetzt war.
+  function olympEigenerBlock(x, y, z, entfernen, merken) {
+    if (!olympia || modus !== 'olymp') return false;
+    const k = x + ',' + y + ',' + z;
+    if (merken) { olympia.gesetzt.add(k); return true; }
+    const war = olympia.gesetzt.has(k);
+    if (entfernen) olympia.gesetzt.delete(k);
+    return war;
+  }
+  function olympPunkteVorschau() { let p = 0; for (const id in olympia.gesammelt) p += olympia.gesammelt[id] * O.WERT[id][0]; return p; }
+  function olympSpeichern(sofort) {
+    const j = performance.now();
+    if (!sofort && j - olympia.speicherZeit < 2000) return;
+    olympia.speicherZeit = j;
+    ls.set(olympia.key, JSON.stringify({ status: olympia.laeuft ? 'lauf' : 'fertig', gesammelt: olympia.gesammelt }));
+  }
+  function olympHud() {
+    const rest = Math.max(0, Math.ceil((olympia.ende - performance.now()) / 1000));
+    $('olympZeit').textContent = '⏱ ' + Math.floor(rest / 60) + ':' + String(rest % 60).padStart(2, '0');
+    $('olympZeit').classList.toggle('knapp', rest <= 30);
+    $('olympPunkte').textContent = '⭐ ' + olympPunkteVorschau().toLocaleString('de-DE');
+  }
+  async function olympPost(art, extra) {
+    const r = await fetch('/api/olymp', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ ticket: olympia.ticket, art }, extra || {})) });
+    let d = {}; try { d = await r.json(); } catch (e) { /* leer */ }
+    return { ok: r.ok, status: r.status, d };
+  }
+  function olympZurueck() {
+    try { sessionStorage.removeItem('quaderland-olymp'); } catch (e) { /* egal */ }
+    const z = olympia.info && olympia.info.zurueck;
+    location.href = typeof z === 'string' && (/^https?:\/\//.test(z) || z[0] === '/') ? z : '/';
+  }
+  $('bOlympZurueck').addEventListener('click', olympZurueck);
+  function olympErgebnisZeigen(d, hinweis) {
+    $('olymp').classList.add('offen');
+    $('olympStartBereich').hidden = true;
+    const e = $('olympErgebnis'); e.hidden = false;
+    e.innerHTML = '';
+    const z = document.createElement('span'); z.className = 'gross-zahl'; z.textContent = d && d.punkte != null ? Number(d.punkte).toLocaleString('de-DE') : '–';
+    const u = document.createElement('span'); u.className = 'einheit'; u.textContent = 'Punkte';
+    const p = document.createElement('p'); p.textContent = hinweis || (d && d.text) || '';
+    e.append(z, u, p);
+    $('bOlympZurueck').hidden = false;
+    $('olympUnter').textContent = 'Dein Versuch ist abgeschlossen.';
+  }
+  async function olympMelden() {
+    $('olympUnter').textContent = 'Wird gewertet …';
+    olympErgebnisZeigen(null, 'Dein Ergebnis wird an die Olympiade gemeldet …');
+    try {
+      const r = await olympPost('ergebnis', { gesammelt: olympia.gesammelt });
+      if (r.ok || r.status === 409) olympErgebnisZeigen(r.d, r.ok ? 'Eingetragen – zurück zur Olympiade, dort siehst du die Wertung.' : 'Dein Versuch war schon gewertet.');
+      else olympErgebnisZeigen(null, r.d.fehler || 'Das Ergebnis konnte nicht gemeldet werden.');
+    } catch (e) { olympErgebnisZeigen(null, 'Keine Verbindung – dein Ergebnis konnte nicht gemeldet werden. Sag der Leitung Bescheid.'); }
+  }
+  function olympEnde() {
+    olympia.laeuft = false; olympSpeichern(true);
+    ueberlagerung = true; abbauStop(); mausLinks = false;
+    if (document.pointerLockElement) document.exitPointerLock();
+    for (const id of ['pause', 'inventar', 'tod']) $(id).classList.remove('offen');
+    $('chateingabe').style.display = 'none';
+    $('olymp').classList.add('ende');
+    $('olympHud').style.display = 'none';
+    setzeVollbildTeile(false);
+    olympMelden();
+  }
+  function olympZaehlerAn(n) { const z = $('olympZaehler'); z.classList.add('an'); const s = $('olympZahl'); s.textContent = n; s.style.animation = 'none'; void s.offsetWidth; s.style.animation = ''; }
+  function olympStart() {
+    $('bOlympStart').disabled = true;
+    let n = 3; olympZaehlerAn(n);
+    const t = setInterval(() => {
+      n--;
+      if (n > 0) return olympZaehlerAn(n);
+      clearInterval(t); olympZaehlerAn('Los!');
+      setTimeout(() => $('olympZaehler').classList.remove('an'), 700);
+      olympLos();
+    }, 1000);
+  }
+  function olympLos() {
+    // Der Server merkt sich den Start; ohne Antwort geht es trotzdem los (er rechnet dann mit der vollen Zeit)
+    olympPost('start').catch(() => {});
+    ls.set(olympia.key, JSON.stringify({ status: 'lauf', gesammelt: {} }));
+    olympia.gesammelt = {}; olympia.gesetzt.clear();
+    weltLaden(olympia.seed, []); tageszeit = 0.25;
+    spielmodus = 'ueberleben';   // nur fuer diesen Versuch, ohne die gespeicherte Wahl zu ueberschreiben
+    $('olymp').classList.remove('offen');
+    olympia.laeuft = true; olympia.ende = performance.now() + olympia.minuten * 60000;
+    starten('olymp', {});
+    $('olympHud').style.display = 'flex'; olympHud();
+    meldung('Sammle Rohstoffe: Holz, Kohle, Eisen, Gold, Diamanten – je seltener, desto mehr Punkte!');
+  }
+  async function olympInit() {
+    $('menue').classList.remove('offen');
+    $('olymp').classList.add('offen');
+    $('bOlympStart').addEventListener('click', olympStart);
+    let r;
+    try { r = await olympPost('info'); } catch (e) { r = { ok: false, d: { fehler: 'Keine Verbindung zum Server.' } }; }
+    if (!r.ok) {
+      $('olympFehler').textContent = r.d.fehler || 'Das Olympia-Ticket konnte nicht geprüft werden.';
+      $('bOlympStart').hidden = true; $('olympRegel').hidden = true; return;
+    }
+    const d = r.d, i = d.info;
+    olympia.info = i; olympia.minuten = d.minuten; olympia.seed = d.seed;
+    olympia.key = 'olymp.' + i.lauf + '.' + i.spieler;
+    $('olympTitel').textContent = (i.titel || 'Olympiade') + (i.nr && i.von ? ' · Disziplin ' + i.nr + '/' + i.von : '');
+    $('olympName').textContent = i.name || 'Spieler';
+    const reg = $('olympRegel'); reg.innerHTML = '';
+    const b = document.createElement('b'); b.textContent = 'Sammel-Wettlauf: ' + d.minuten + ' Minuten. ';
+    reg.append(b, 'Alle spielen dieselbe Welt im Überlebensmodus. Schlag Bäume, bau Werkzeuge und sammle Rohstoffe: Erde, Sand und Holz bringen wenig, Kohle, Eisen, Gold und Diamanten viel. Selbst gesetzte Blöcke zählen nicht. Ein Versuch pro Person.');
+    if (d.ergebnis) return olympErgebnisZeigen(d.ergebnis, 'Dein Versuch ist schon gewertet.');
+    // Seite mitten im Versuch neu geladen: den gespeicherten Stand melden (der Server deckelt nach Zeit)
+    let alt = null; try { alt = JSON.parse(ls.get(olympia.key, 'null')); } catch (e) { /* egal */ }
+    if (alt && alt.status) { olympia.gesammelt = alt.gesammelt || {}; return olympMelden(); }
+    olympPost('da').catch(() => {});
+    const bs = $('bOlympStart'); bs.disabled = false; bs.textContent = 'Los geht’s – Countdown starten';
+  }
+  if (olympia) olympInit();
+
   /* ---------- Hauptschleife ---------- */
   let letzte = performance.now(), fpsZaehler = 0, fpsZeit = 0, fps = 0, infoZeit = 0, lebenZeit = 0;
   function frame(t) {
@@ -1705,7 +1869,13 @@
     const aktiv = !ueberlagerung && !chatOffen;
     if (aktiv) physik(dt);
     if (modus === 'online') tageszeit = W.phaseAusZeit(Date.now() + zeitOffset);
+    else if (modus === 'olymp') { /* Olympiade: fester Tag, fuer alle gleich */ }
     else if (!ueberlagerung) tageszeit = (tageszeit + dt / W.DAUER) % 1;
+    if (modus === 'olymp' && olympia.laeuft) {
+      olympia.hudZeit += dt;
+      if (olympia.hudZeit > 0.25) { olympia.hudZeit = 0; olympHud(); }
+      if (performance.now() >= olympia.ende) olympEnde();
+    }
     if (hauSperre > 0) hauSperre -= dt;
     lebenSchritt(aktiv ? dt : 0);
 
