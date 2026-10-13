@@ -36,61 +36,145 @@
   atlasTex.minFilter = THREE.NearestFilter;
   atlasTex.generateMipmaps = false;
 
-  // Block-Shader: Textur x Schatten/AO x Licht (Himmelslicht wird mit der Tageszeit skaliert, Blocklicht ist warm)
+  // Block-Shader: Textur x Schatten/AO x Licht (Himmelslicht wird mit der Tageszeit skaliert, Blocklicht ist warm).
+  // Der Nebel nimmt zur Sonne hin etwas Sonnenfarbe an (Dunst), Wasser glitzert und spiegelt den Himmel.
   const uniforms = {
     karte: { value: atlasTex }, tag: { value: 1 }, himmelTon: { value: new THREE.Color(1, 1, 1) },
     nebelFarbe: { value: new THREE.Color(0x87ceeb) }, nebelNah: { value: 40 }, nebelFern: { value: 100 },
-    deckkraft: { value: 1 }, schnitt: { value: 0.5 }
+    deckkraft: { value: 1 }, schnitt: { value: 0.5 }, zeit: { value: 0 },
+    sonnenRichtung: { value: new THREE.Vector3(0, 1, 0) }, sonnenFarbe: { value: new THREE.Color(1, 0.95, 0.8) }, sonnenStaerke: { value: 1 },
+    himmelHorizont: { value: new THREE.Color(0x9fd6f2) }, himmelZenit: { value: new THREE.Color(0x3f86d8) }
   };
-  const VS = `
+  const VS_KOPF = `
     attribute vec3 farbe; attribute vec2 licht;
-    varying vec2 vUv; varying vec3 vFarbe; varying vec2 vLicht; varying float vTiefe;
+    varying vec2 vUv; varying vec3 vFarbe; varying vec2 vLicht; varying float vTiefe; varying vec3 vWelt;`;
+  const VS = VS_KOPF + `
     void main() {
       vUv = uv; vFarbe = farbe; vLicht = licht;
-      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vec4 w = modelMatrix * vec4(position, 1.0);
+      vWelt = w.xyz;
+      vec4 mv = viewMatrix * w;
       vTiefe = -mv.z;
       gl_Position = projectionMatrix * mv;
     }`;
-  const FS = `
-    uniform sampler2D karte; uniform float tag; uniform vec3 himmelTon; uniform vec3 nebelFarbe;
-    uniform float nebelNah; uniform float nebelFern; uniform float deckkraft; uniform float schnitt;
-    varying vec2 vUv; varying vec3 vFarbe; varying vec2 vLicht; varying float vTiefe;
+  // Wasseroberflaeche wogt leicht (nur die Oberkante, benachbarte Ecken bewegen sich gleich -> keine Risse)
+  const VS_WASSER = VS_KOPF + `
+    uniform float zeit;
     void main() {
-      vec4 t = texture2D(karte, vUv);
-      if (t.a < schnitt) discard;
+      vUv = uv; vFarbe = farbe; vLicht = licht;
+      vec4 w = modelMatrix * vec4(position, 1.0);
+      float oben = step(0.8, fract(position.y));
+      w.y += oben * (sin(w.x * 1.3 + zeit * 1.6) * cos(w.z * 1.1 + zeit * 1.3) * 0.035 + sin((w.x + w.z) * 0.7 - zeit) * 0.015);
+      vWelt = w.xyz;
+      vec4 mv = viewMatrix * w;
+      vTiefe = -mv.z;
+      gl_Position = projectionMatrix * mv;
+    }`;
+  const FS_KOPF = `
+    uniform sampler2D karte; uniform float tag; uniform vec3 himmelTon; uniform vec3 nebelFarbe;
+    uniform float nebelNah; uniform float nebelFern; uniform float deckkraft; uniform float schnitt; uniform float zeit;
+    uniform vec3 sonnenRichtung; uniform vec3 sonnenFarbe; uniform float sonnenStaerke; uniform vec3 himmelHorizont; uniform vec3 himmelZenit;
+    varying vec2 vUv; varying vec3 vFarbe; varying vec2 vLicht; varying float vTiefe; varying vec3 vWelt;
+    vec3 beleuchtet(vec3 tex) {
       float s = pow(0.8, (1.0 - vLicht.x) * 15.0) * tag;
       float b = pow(0.8, (1.0 - vLicht.y) * 15.0);
       vec3 l = max(himmelTon * s, vec3(1.0, 0.84, 0.62) * b);
       l = max(l, vec3(0.025));
-      vec3 c = t.rgb * vFarbe * l;
-      c = mix(c, nebelFarbe, smoothstep(nebelNah, nebelFern, vTiefe));
-      gl_FragColor = vec4(c, t.a * deckkraft);
+      vec3 c = tex * vFarbe * l;
+      float lum = dot(c, vec3(0.299, 0.587, 0.114));
+      return mix(vec3(lum), c, 1.1);
+    }
+    vec3 mitNebel(vec3 c, vec3 dir) {
+      float sd = max(dot(dir, sonnenRichtung), 0.0);
+      vec3 nf = mix(nebelFarbe, sonnenFarbe, pow(sd, 5.0) * sonnenStaerke * 0.5);
+      return mix(c, nf, smoothstep(nebelNah, nebelFern, vTiefe));
+    }`;
+  const FS = FS_KOPF + `
+    void main() {
+      vec4 t = texture2D(karte, vUv);
+      if (t.a < schnitt) discard;
+      vec3 dir = normalize(vWelt - cameraPosition);
+      gl_FragColor = vec4(mitNebel(beleuchtet(t.rgb), dir), t.a * deckkraft);
+    }`;
+  const FS_WASSER = FS_KOPF + `
+    void main() {
+      vec4 t = texture2D(karte, vUv);
+      vec3 dir = normalize(vWelt - cameraPosition);
+      vec3 c = beleuchtet(t.rgb);
+      vec3 fn = normalize(cross(dFdx(vWelt), dFdy(vWelt)));
+      float oben = smoothstep(0.7, 0.95, abs(fn.y)) * step(vWelt.y, cameraPosition.y + 0.001);
+      vec2 p = vWelt.xz;
+      float a1 = p.x * 1.9 + zeit * 1.4, a2 = p.y * 2.3 - zeit * 1.1, a3 = (p.x + p.y) * 3.1 + zeit * 2.0;
+      vec3 n = normalize(vec3(cos(a1) * 0.16 + cos(a3) * 0.1, 1.0, cos(a2) * 0.16 + cos(a3) * 0.1));
+      float fres = pow(1.0 - max(dot(n, -dir), 0.0), 4.0);
+      vec3 r = reflect(dir, n);
+      float sonne = pow(max(dot(r, sonnenRichtung), 0.0), 110.0) * sonnenStaerke;
+      vec3 himmel = mix(himmelHorizont, himmelZenit, clamp(r.y * 1.4, 0.0, 1.0));
+      float kamm = smoothstep(1.7, 2.2, sin(a1) + sin(a2) + sin(a3) * 0.6) * 0.14 * (0.3 + 0.7 * tag);
+      c = mix(c, himmel * (0.55 + 0.45 * tag), fres * 0.7 * oben);
+      c += (sonnenFarbe * sonne * 1.6 + kamm) * oben;
+      float alpha = mix(deckkraft, 0.94, fres * oben);
+      gl_FragColor = vec4(mitNebel(c, dir), alpha);
     }`;
   const matBlock = new THREE.ShaderMaterial({ uniforms, vertexShader: VS, fragmentShader: FS });
   const wasserUniforms = Object.assign({}, uniforms, { deckkraft: { value: 0.74 }, schnitt: { value: 0.01 } });
-  const matWasser = new THREE.ShaderMaterial({ uniforms: wasserUniforms, vertexShader: VS, fragmentShader: FS, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+  const matWasser = new THREE.ShaderMaterial({ uniforms: wasserUniforms, vertexShader: VS_WASSER, fragmentShader: FS_WASSER, transparent: true, depthWrite: false, side: THREE.DoubleSide, extensions: { derivatives: true } });
 
-  // Himmel: Sonne, Mond, Sterne, Wolken
-  const sonne = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.MeshBasicMaterial({ color: 0xfff2b0, fog: false, depthWrite: false }));
-  const mond = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshBasicMaterial({ color: 0xdfe8ff, fog: false, depthWrite: false }));
+  // Himmel: Farbverlauf-Kuppel, Sonne mit Strahlenkranz, Mond mit Kratern, Sterne, Wolken
+  const himmelKuppel = new THREE.Mesh(new THREE.SphereGeometry(520, 24, 14), new THREE.ShaderMaterial({
+    uniforms: { horizont: uniforms.himmelHorizont, zenit: uniforms.himmelZenit, sonnenRichtung: uniforms.sonnenRichtung, sonnenFarbe: uniforms.sonnenFarbe, sonnenStaerke: uniforms.sonnenStaerke },
+    vertexShader: `varying vec3 vRicht; void main() { vRicht = position; gl_Position = (projectionMatrix * modelViewMatrix * vec4(position, 1.0)).xyww; }`,
+    fragmentShader: `uniform vec3 horizont; uniform vec3 zenit; uniform vec3 sonnenRichtung; uniform vec3 sonnenFarbe; uniform float sonnenStaerke; varying vec3 vRicht;
+      void main() {
+        vec3 d = normalize(vRicht);
+        float h = clamp(d.y, 0.0, 1.0);
+        vec3 c = mix(horizont, zenit, pow(h, 0.5));
+        float s = max(dot(d, sonnenRichtung), 0.0);
+        c += sonnenFarbe * (pow(s, 6.0) * 0.2 + pow(s, 2.0) * 0.07) * sonnenStaerke * (1.0 - h * 0.5);
+        c = mix(c, horizont, 1.0 - smoothstep(0.0, 0.05, d.y));
+        c += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 160.0;
+        gl_FragColor = vec4(c, 1.0);
+      }`,
+    side: THREE.BackSide, depthWrite: false, fog: false
+  }));
+  himmelKuppel.frustumCulled = false; himmelKuppel.renderOrder = -4;
+  szene.add(himmelKuppel);
+  const sonnenTex = new THREE.CanvasTexture(Texturen.sonne()), mondTex = new THREE.CanvasTexture(Texturen.mond());
+  const sonne = new THREE.Mesh(new THREE.PlaneGeometry(190, 190), new THREE.MeshBasicMaterial({ map: sonnenTex, transparent: true, fog: false, depthWrite: false }));
+  const mond = new THREE.Mesh(new THREE.PlaneGeometry(90, 90), new THREE.MeshBasicMaterial({ map: mondTex, transparent: true, fog: false, depthWrite: false }));
   sonne.renderOrder = mond.renderOrder = -1;
   szene.add(sonne); szene.add(mond);
-  const sternPos = new Float32Array(600 * 3);
+  const sternPos = new Float32Array(600 * 3), sternFarbe = new Float32Array(600 * 3);
   for (let i = 0; i < 600; i++) {
     const a = Math.random() * Math.PI * 2, b = Math.acos(2 * Math.random() - 1), r = 480;
     sternPos[i * 3] = r * Math.sin(b) * Math.cos(a); sternPos[i * 3 + 1] = r * Math.cos(b); sternPos[i * 3 + 2] = r * Math.sin(b) * Math.sin(a);
+    const hell = 0.45 + Math.random() * 0.55, w = Math.random();
+    sternFarbe[i * 3] = hell * (w < 0.2 ? 1 : 0.85); sternFarbe[i * 3 + 1] = hell * 0.9; sternFarbe[i * 3 + 2] = hell * (w > 0.7 ? 1 : 0.8 + w * 0.2);
   }
   const sterneGeo = new THREE.BufferGeometry();
   sterneGeo.setAttribute('position', new THREE.BufferAttribute(sternPos, 3));
-  const sterne = new THREE.Points(sterneGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 2, sizeAttenuation: false, transparent: true, opacity: 0, fog: false, depthWrite: false }));
+  sterneGeo.setAttribute('color', new THREE.BufferAttribute(sternFarbe, 3));
+  const sterne = new THREE.Points(sterneGeo, new THREE.PointsMaterial({ color: 0xffffff, vertexColors: true, size: 2, sizeAttenuation: false, transparent: true, opacity: 0, fog: false, depthWrite: false }));
   sterne.frustumCulled = false; sterne.renderOrder = -2;
   szene.add(sterne);
+  // Wolken: weiche Pixelwolken mit Licht von oben, zum Rand hin ausgeblendet (nicht vom Nebel verschluckt)
   const WOLKEN_GROESSE = 1024;
   const wolkenTex = new THREE.CanvasTexture(Texturen.wolken(7));
-  wolkenTex.magFilter = THREE.NearestFilter; wolkenTex.minFilter = THREE.NearestFilter; wolkenTex.generateMipmaps = false;
+  wolkenTex.magFilter = THREE.LinearFilter; wolkenTex.minFilter = THREE.LinearFilter; wolkenTex.generateMipmaps = false;
   wolkenTex.wrapS = wolkenTex.wrapT = THREE.RepeatWrapping;
-  const wolken = new THREE.Mesh(new THREE.PlaneGeometry(WOLKEN_GROESSE, WOLKEN_GROESSE),
-    new THREE.MeshBasicMaterial({ map: wolkenTex, transparent: true, opacity: 0.85, depthWrite: false, side: THREE.DoubleSide }));
+  const wolkenUniforms = { karte: { value: wolkenTex }, versatz: { value: new THREE.Vector2() }, farbe: { value: new THREE.Color(1, 1, 1) }, horizont: uniforms.himmelHorizont, deckkraft: { value: 0.9 } };
+  const wolken = new THREE.Mesh(new THREE.PlaneGeometry(WOLKEN_GROESSE, WOLKEN_GROESSE), new THREE.ShaderMaterial({
+    uniforms: wolkenUniforms, transparent: true, depthWrite: false, side: THREE.DoubleSide, fog: false,
+    vertexShader: 'varying vec2 vUv; varying vec2 vP; void main() { vUv = uv; vP = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: `uniform sampler2D karte; uniform vec2 versatz; uniform vec3 farbe; uniform vec3 horizont; uniform float deckkraft; varying vec2 vUv; varying vec2 vP;
+      void main() {
+        vec4 t = texture2D(karte, vUv * 1.5 + versatz);
+        float r = length(vP) / 512.0;
+        float a = t.a * deckkraft * (1.0 - smoothstep(0.35, 0.98, r));
+        vec3 c = mix(t.rgb * farbe, horizont, smoothstep(0.25, 1.0, r) * 0.55);
+        gl_FragColor = vec4(c, a);
+      }`
+  }));
   wolken.rotation.x = -Math.PI / 2; wolken.renderOrder = 2;
   szene.add(wolken);
 
@@ -108,24 +192,57 @@
   risse.visible = false;
   szene.add(risse);
 
-  // Partikel beim Abbauen
-  const partikelGeo = new THREE.BoxGeometry(0.13, 0.13, 0.13);
+  // Partikel: Bruchstuecke in echten Kachelfarben (mit Aufprall am Boden), Funken bei Gold/Diamant, Staub beim Setzen.
+  // Auf dem Handy etwas weniger (Qualitaetsstufe ueber 'touch').
+  const PARTIKEL_QUALI = touch ? 0.6 : 1;
+  const partikelGeo = new THREE.BoxGeometry(1, 1, 1);
   const partikel = [];
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < (touch ? 80 : 150); i++) {
     const m = new THREE.Mesh(partikelGeo, new THREE.MeshBasicMaterial({ color: 0xffffff }));
     m.visible = false; szene.add(m);
-    partikel.push({ m, vx: 0, vy: 0, vz: 0, t: 0 });
+    partikel.push({ m, vx: 0, vy: 0, vz: 0, t: 0, gr: 18, sz: 0.1, sx: 0, sy: 0, funke: false });
   }
   let partikelIndex = 0;
-  function partikelSpruehen(x, y, z, b, hell) {
+  function partikelNeu(x, y, z, vx, vy, vz, r, g, b, leben, groesse, gr, funke) {
+    const p = partikel[partikelIndex++ % partikel.length];
+    p.m.visible = true; p.t = leben; p.vx = vx; p.vy = vy; p.vz = vz; p.gr = gr; p.sz = groesse; p.funke = !!funke;
+    p.sx = (Math.random() - 0.5) * 9; p.sy = (Math.random() - 0.5) * 9;
+    p.m.position.set(x, y, z); p.m.rotation.set(Math.random() * 3, Math.random() * 3, 0);
+    p.m.material.color.setRGB(r, g, b);
+    p.m.scale.setScalar(groesse);
+  }
+  const FUNKEN = { [W.GOLDERZ]: [1, 0.88, 0.3], [W.DIAMANTERZ]: [0.55, 1, 0.95] };
+  function kachelFarbe(kachel, hell) {
+    const pal = Texturen.paletten[kachel];
+    if (!pal || !pal.length) return [hell, hell, hell];
+    const f = pal[Math.floor(Math.random() * pal.length)], j = 0.85 + Math.random() * 0.3;
+    return [f[0] * hell * j, f[1] * hell * j, f[2] * hell * j];
+  }
+  // menge: Anzahl vor Qualitaetsstufe; klein = Staub (langsamer, kleiner)
+  function partikelSpruehen(x, y, z, b, hell, menge, klein) {
     const t = W.TAB[b]; if (!t || !t[3]) return;
-    const f = Texturen.mittelfarben[t[3]] || [1, 1, 1];
-    for (let i = 0; i < 10; i++) {
-      const p = partikel[partikelIndex++ % partikel.length];
-      p.m.visible = true; p.t = 0.5 + Math.random() * 0.4;
-      p.m.position.set(x + 0.2 + Math.random() * 0.6, y + 0.2 + Math.random() * 0.6, z + 0.2 + Math.random() * 0.6);
-      p.vx = (Math.random() - 0.5) * 3; p.vy = 1.5 + Math.random() * 2.5; p.vz = (Math.random() - 0.5) * 3;
-      p.m.material.color.setRGB(f[0] * hell, f[1] * hell, f[2] * hell);
+    const n = Math.max(2, Math.round((menge || 16) * PARTIKEL_QUALI));
+    for (let i = 0; i < n; i++) {
+      const px = 0.15 + Math.random() * 0.7, py = 0.15 + Math.random() * 0.7, pz = 0.15 + Math.random() * 0.7;
+      const f = kachelFarbe(Math.random() < 0.35 ? t[1] : t[3], hell);
+      const aus = klein ? 0.8 : 2.2;
+      partikelNeu(x + px, y + py, z + pz, (px - 0.5) * aus + (Math.random() - 0.5) * 1.6, klein ? 0.6 + Math.random() * 1.2 : 1.2 + Math.random() * 3, (pz - 0.5) * aus + (Math.random() - 0.5) * 1.6,
+        f[0], f[1], f[2], 0.55 + Math.random() * 0.6, (klein ? 0.05 : 0.07) + Math.random() * (klein ? 0.05 : 0.09), 18);
+    }
+    const fk = FUNKEN[b];
+    if (fk && !klein) for (let i = 0; i < Math.round(7 * PARTIKEL_QUALI); i++) {
+      partikelNeu(x + 0.5 + (Math.random() - 0.5) * 0.9, y + 0.5 + (Math.random() - 0.5) * 0.9, z + 0.5 + (Math.random() - 0.5) * 0.9,
+        (Math.random() - 0.5) * 1.6, 0.8 + Math.random() * 1.8, (Math.random() - 0.5) * 1.6, fk[0], fk[1], fk[2], 0.5 + Math.random() * 0.5, 0.05 + Math.random() * 0.04, 2, true);
+    }
+  }
+  // Kleine Splitter an der angezielten Flaeche, solange man abbaut
+  function partikelSplitter(z0, hell) {
+    const t = W.TAB[z0.b]; if (!t || !t[3]) return;
+    for (let i = 0; i < Math.max(1, Math.round(2 * PARTIKEL_QUALI)); i++) {
+      const f = kachelFarbe(t[3], hell);
+      const ox = z0.nx ? z0.nx * 0.52 : Math.random() - 0.5, oy = z0.ny ? z0.ny * 0.52 : Math.random() - 0.5, oz = z0.nz ? z0.nz * 0.52 : Math.random() - 0.5;
+      partikelNeu(z0.x + 0.5 + ox, z0.y + 0.5 + oy, z0.z + 0.5 + oz, z0.nx * 1.2 + (Math.random() - 0.5) * 1.2, 0.8 + Math.random() * 1.5, z0.nz * 1.2 + (Math.random() - 0.5) * 1.2,
+        f[0], f[1], f[2], 0.4 + Math.random() * 0.35, 0.04 + Math.random() * 0.05, 18);
     }
   }
   function partikelBewegen(dt) {
@@ -133,9 +250,15 @@
       if (!p.m.visible) continue;
       p.t -= dt;
       if (p.t <= 0) { p.m.visible = false; continue; }
-      p.vy -= 18 * dt;
-      p.m.position.x += p.vx * dt; p.m.position.y += p.vy * dt; p.m.position.z += p.vz * dt;
-      p.m.scale.setScalar(Math.min(1, p.t * 2.5));
+      p.vy -= p.gr * dt;
+      const pos = p.m.position;
+      pos.x += p.vx * dt; pos.z += p.vz * dt;
+      const ny = pos.y + p.vy * dt;
+      if (!p.funke && p.vy < 0 && OPAK[getBlock(Math.floor(pos.x), Math.floor(ny - p.sz * 0.5), Math.floor(pos.z))]) {
+        p.vy = -p.vy * 0.32; p.vx *= 0.55; p.vz *= 0.55; if (Math.abs(p.vy) < 0.6) p.vy = 0;
+      } else pos.y = ny;
+      p.m.rotation.x += p.sx * dt; p.m.rotation.y += p.sy * dt;
+      p.m.scale.setScalar(p.sz * Math.min(1, p.t * 3) * (p.funke ? (0.7 + 0.3 * Math.sin(p.t * 40)) : 1));
     }
   }
 
@@ -332,6 +455,21 @@
   const ECKEN = [[0, 0], [1, 0], [1, 1], [0, 1]], ECKEN_R = [[0, 1], [1, 1], [1, 0], [0, 0]];
   const AOF = [0.5, 0.68, 0.84, 1];
   const ATLAS_B = Texturen.SPALTEN * Texturen.ZELLE, ATLAS_H = Texturen.ZEILEN * Texturen.ZELLE, PXT = Texturen.PX, ZEL = Texturen.ZELLE, RND = Texturen.RAND;
+  // Leichte Abwechslung je Block: Helligkeit schwankt etwas, Gras und Laub driften sanft zwischen sattgruen und gelblich.
+  // Das bricht das Kachelmuster auf, ohne die Weltdaten anzufassen (nur Vertexfarben).
+  const TON_NEUTRAL = [1, 1, 1];
+  const GRUEN_KACHELN = new Set(['gras_oben', 'gras_seite', 'laub', 'birkenlaub'].map(n => Texturen.index(n)));
+  const _ton = [1, 1, 1];
+  function blockTon(wx, wy, wz, kachel) {
+    let h = Math.imul(wx, 374761393) ^ Math.imul(wy, 668265263) ^ Math.imul(wz, 1274126177);
+    h = Math.imul(h ^ (h >>> 13), 1274126177); h ^= h >>> 16;
+    const v = 0.93 + 0.07 * ((h >>> 0) / 4294967296);
+    if (GRUEN_KACHELN.has(kachel)) {
+      const f = 0.5 + 0.28 * Math.sin(wx * 0.065 + 1.3) + 0.22 * Math.sin(wz * 0.052 + wx * 0.021);
+      _ton[0] = v * (0.86 + 0.14 * f); _ton[1] = v * (0.96 + 0.04 * (1 - f)); _ton[2] = v * (0.84 + 0.16 * (1 - f));
+    } else { _ton[0] = _ton[1] = _ton[2] = v; }
+    return _ton;
+  }
   const neuerPuffer = () => ({ p: [], f: [], l: [], u: [], i: [], n: 0 });
 
   function baueMesh(c) {
@@ -381,6 +519,7 @@
       }
       const col = kachel % Texturen.SPALTEN, row = Math.floor(kachel / Texturen.SPALTEN), ein = 0.02, br = PXT - 2 * ein;
       const basis = buf.n;
+      const ton = wasser ? TON_NEUTRAL : blockTon(c.cx * CX + x - M, y, c.cz * CX + z - M, kachel);
       for (let k = 0; k < 4; k++) {
         const cu = ecken[k][0], cv = ecken[k][1];
         const vx = x - M + en[0] * (s > 0 ? 1 : 0) + eu[0] * cu + ev[0] * cv;
@@ -391,8 +530,8 @@
         let su, tu;
         if (n === 0) { su = cv; tu = cu; } else { su = cu; tu = cv; }
         buf.u.push((col * ZEL + RND + ein + su * br) / ATLAS_B, 1 - (row * ZEL + RND + ein + (1 - tu) * br) / ATLAS_H);
-        const h = Math.round(255 * schatten * AOF[ao[k]]);
-        buf.f.push(h, h, h);
+        const h = 255 * schatten * AOF[ao[k]];
+        buf.f.push(Math.round(h * ton[0]), Math.round(h * ton[1]), Math.round(h * ton[2]));
         buf.l.push(Math.round(lsk[k] * 17), Math.round(lbk[k] * 17));
       }
       if (ao[0] + ao[2] > ao[1] + ao[3]) buf.i.push(basis, basis + 1, basis + 2, basis, basis + 2, basis + 3);
@@ -712,50 +851,174 @@
   let tiereLokal = null;        // Einzelwelt: Tiere rechnet der Browser selbst
   const tierAnsicht = new Map(); // id -> Figur
   const ARTEN_NACH_NR = Tiere.ART_LISTE;
+  // ---------- Figuren: gemeinsame Bausteine ----------
+  // Quader mit eingebackener Flaechenschattierung (oben hell, unten dunkel) und leichtem Pixelrauschen:
+  // gibt den Figuren Volumen, obwohl sie ohne echte Lichtberechnung gezeichnet werden. Geometrien werden geteilt.
+  const fellTex = new THREE.CanvasTexture(Texturen.fellKachel());
+  fellTex.magFilter = fellTex.minFilter = THREE.NearestFilter; fellTex.generateMipmaps = false;
+  fellTex.wrapS = fellTex.wrapT = THREE.RepeatWrapping;
+  const schattenTex = new THREE.CanvasTexture(Texturen.schattenFleck());
+  const schattenGeo = new THREE.PlaneGeometry(1, 1); schattenGeo.rotateX(-Math.PI / 2);
+  const FLAECHEN_TON = [0.86, 0.86, 1, 0.56, 0.93, 0.72]; // +x, -x, +y, -y, +z, -z (Reihenfolge von BoxGeometry)
+  const boxCache = new Map();
+  function figurBox(b, h, t, pivotY) {
+    const key = b + '|' + h + '|' + t + '|' + pivotY;
+    let geo = boxCache.get(key);
+    if (geo) return geo;
+    geo = new THREE.BoxGeometry(b, h, t); geo.translate(0, -pivotY, 0);
+    const col = new Float32Array(24 * 3), uv = geo.attributes.uv;
+    const masse = [[t, h], [t, h], [b, t], [b, t], [b, h], [b, h]];
+    for (let f = 0; f < 6; f++) for (let v = 0; v < 4; v++) {
+      const i = f * 4 + v;
+      col[i * 3] = col[i * 3 + 1] = col[i * 3 + 2] = FLAECHEN_TON[f];
+      uv.setXY(i, uv.getX(i) * masse[f][0] * 2, uv.getY(i) * masse[f][1] * 2);   // 16 Pixel je Block bei 8-Pixel-Kachel
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    geo.userData.geteilt = true;
+    boxCache.set(key, geo);
+    return geo;
+  }
+  // Liefert eine "teil"-Funktion, die Quader an eine Gruppe haengt. Gleiche Farben teilen sich ein Material.
+  // leucht: wird nicht vom Licht abgedunkelt (Augen der Zombies); glatt: ohne Pixelrauschen (Augen, Schnabel ...)
+  function bauteile(g) {
+    const mats = [], cache = new Map();
+    const teil = (b, h, t, col, x, y, z, pivotY, eltern, glatt, leucht) => {
+      const key = col + (glatt ? 'g' : 'f') + (leucht ? 'l' : '');
+      let mat = cache.get(key);
+      if (!mat) {
+        mat = new THREE.MeshBasicMaterial({ color: col, vertexColors: true, map: glatt || leucht ? null : fellTex });
+        cache.set(key, mat);
+        if (!leucht) mats.push([mat, new THREE.Color(col)]);
+      }
+      const m = new THREE.Mesh(figurBox(b, h, t, pivotY || 0), mat);
+      m.position.set(x, y, z); (eltern || g).add(m); return m;
+    };
+    return { teil, mats };
+  }
+  function gruppe(g, x, y, z) { const k = new THREE.Group(); k.position.set(x, y, z); g.add(k); return k; }
+  function schattenFleck(groesse) {
+    const m = new THREE.Mesh(schattenGeo, new THREE.MeshBasicMaterial({ map: schattenTex, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2, fog: false }));
+    m.scale.set(groesse, 1, groesse); m.renderOrder = 1; m.visible = false;
+    szene.add(m);
+    return m;
+  }
+  // Oberkante des Bodens unter einem Punkt (fuer Schattenflecken), null wenn nichts nah genug ist
+  function bodenUnter(x, y, z) {
+    const ix = Math.floor(x), iz = Math.floor(z);
+    for (let iy = Math.floor(y + 0.3), n = 0; n < 6 && iy >= 0; n++, iy--) if (OPAK[getBlock(ix, iy, iz)]) return iy + 1;
+    return null;
+  }
+  function schattenSetzen(sm, x, y, z, basis) {
+    const b = bodenUnter(x, y, z);
+    if (b === null) { sm.visible = false; return; }
+    sm.visible = true;
+    sm.position.set(x, b + 0.02, z);
+    sm.material.opacity = basis * Math.max(0, 1 - (y - b) * 0.35) * (0.45 + 0.55 * uniforms.tag.value);
+  }
+  function figurFreigeben(o) {
+    o.traverse(c => { if (c.geometry && !c.geometry.userData.geteilt) c.geometry.dispose(); if (c.material) { if (c.material.map && c.material.map !== fellTex) c.material.map.dispose(); c.material.dispose(); } });
+  }
+
   function tierFigur(nr) {
     const art = ARTEN_NACH_NR[nr];
     const g = new THREE.Group();
-    const mats = [];
-    const teil = (b, h, t, col, x, y, z, pivotY) => {
-      const geo = new THREE.BoxGeometry(b, h, t); geo.translate(0, -(pivotY || 0), 0);
-      const mat = new THREE.MeshBasicMaterial({ color: col });
-      mats.push([mat, new THREE.Color(col)]);
-      const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); g.add(m); return m;
-    };
+    const { teil, mats } = bauteile(g);
     const beine = [];
+    const f = { fluegel: [], ohren: [], schwanz: null, kopf: null, arme: [] };
     if (art === 'schaf') {
-      teil(0.9, 0.75, 1.15, 0xeeeeee, 0, 0.82, 0.05);
-      teil(0.46, 0.46, 0.46, 0xd8cfc4, 0, 1.05, -0.65);
-      teil(0.08, 0.08, 0.02, 0x111111, -0.12, 1.1, -0.89); teil(0.08, 0.08, 0.02, 0x111111, 0.12, 1.1, -0.89);
-      for (const [x, z] of [[-0.28, -0.35], [0.28, -0.35], [-0.28, 0.4], [0.28, 0.4]]) beine.push(teil(0.2, 0.48, 0.2, 0xd8cfc4, x, 0.48, z, 0.24));
+      const WOLLE = 0xf1eee6, WOLLE2 = 0xe3dfd2, HAUT_S = 0xcbbca4, DUNKEL = 0x9c8c74;
+      teil(0.92, 0.8, 1.2, WOLLE, 0, 0.86, 0.04);
+      teil(1.0, 0.52, 0.98, WOLLE2, 0, 0.8, 0.04);
+      teil(0.62, 0.12, 0.74, 0xf8f6ef, 0, 1.3, 0.02);
+      f.schwanz = teil(0.2, 0.2, 0.14, WOLLE, 0, 1.0, 0.68);
+      const kopf = f.kopf = gruppe(g, 0, 1.05, -0.6);
+      teil(0.4, 0.42, 0.42, HAUT_S, 0, 0, -0.12, 0, kopf);
+      teil(0.46, 0.16, 0.44, WOLLE, 0, 0.24, -0.06, 0, kopf);
+      teil(0.22, 0.14, 0.05, DUNKEL, 0, -0.1, -0.35, 0, kopf, true);
+      for (const s of [-1, 1]) {
+        teil(0.1, 0.1, 0.02, 0xffffff, s * 0.11, 0.06, -0.335, 0, kopf, true);
+        teil(0.05, 0.08, 0.02, 0x14110e, s * 0.1, 0.055, -0.347, 0, kopf, true);
+        const o = teil(0.2, 0.08, 0.13, DUNKEL, s * 0.29, 0.1, -0.04, 0, kopf); o.rotation.z = s * 0.45; f.ohren.push(o);
+      }
+      for (const [x, z] of [[-0.28, -0.35], [0.28, -0.35], [-0.28, 0.4], [0.28, 0.4]]) {
+        const bein = teil(0.2, 0.5, 0.2, 0x7c7060, x, 0.5, z, 0.25);
+        teil(0.22, 0.1, 0.22, 0x2e2a26, 0, -0.45, 0, 0, bein);
+        beine.push(bein);
+      }
     } else if (art === 'schwein') {
-      teil(0.85, 0.62, 1.1, 0xf0a0a8, 0, 0.62, 0.05);
-      teil(0.56, 0.56, 0.5, 0xf0a0a8, 0, 0.78, -0.7);
-      teil(0.28, 0.18, 0.06, 0xd77c88, 0, 0.72, -0.97);
-      teil(0.08, 0.08, 0.02, 0x111111, -0.15, 0.88, -0.96); teil(0.08, 0.08, 0.02, 0x111111, 0.15, 0.88, -0.96);
-      for (const [x, z] of [[-0.25, -0.35], [0.25, -0.35], [-0.25, 0.42], [0.25, 0.42]]) beine.push(teil(0.22, 0.32, 0.22, 0xe08e98, x, 0.32, z, 0.16));
+      const ROSA = 0xf2a6ae, ROSA2 = 0xe58b96;
+      teil(0.88, 0.66, 1.12, ROSA, 0, 0.64, 0.05);
+      teil(0.7, 0.05, 0.9, 0xf7b7bd, 0, 0.99, 0.05);
+      f.schwanz = teil(0.06, 0.06, 0.16, ROSA2, 0, 0.84, 0.66); f.schwanz.rotation.x = -0.6;
+      const kopf = f.kopf = gruppe(g, 0, 0.8, -0.54);
+      teil(0.56, 0.52, 0.5, ROSA, 0, 0, -0.2, 0, kopf);
+      teil(0.3, 0.2, 0.14, ROSA2, 0, -0.08, -0.5, 0, kopf);
+      for (const s of [-1, 1]) {
+        teil(0.05, 0.06, 0.02, 0x7a3340, s * 0.07, -0.08, -0.575, 0, kopf, true);
+        teil(0.1, 0.1, 0.02, 0xffffff, s * 0.17, 0.08, -0.455, 0, kopf, true);
+        teil(0.05, 0.08, 0.02, 0x14110e, s * 0.16, 0.075, -0.467, 0, kopf, true);
+        const o = teil(0.17, 0.14, 0.05, ROSA2, s * 0.2, 0.3, -0.14, 0, kopf); o.rotation.z = -s * 0.5; o.rotation.x = -0.35; f.ohren.push(o);
+      }
+      for (const [x, z] of [[-0.25, -0.35], [0.25, -0.35], [-0.25, 0.42], [0.25, 0.42]]) {
+        const bein = teil(0.22, 0.32, 0.22, 0xe791a0, x, 0.32, z, 0.16);
+        teil(0.23, 0.07, 0.23, 0xa5606b, 0, -0.29, 0, 0, bein);
+        beine.push(bein);
+      }
     } else if (art === 'huhn') {
-      teil(0.4, 0.38, 0.52, 0xf6f6f6, 0, 0.45, 0.04);
-      teil(0.26, 0.34, 0.24, 0xf6f6f6, 0, 0.72, -0.22);
-      teil(0.12, 0.08, 0.14, 0xf0a020, 0, 0.72, -0.38);
-      teil(0.08, 0.1, 0.06, 0xd02020, 0, 0.64, -0.36);
-      teil(0.05, 0.05, 0.02, 0x111111, -0.08, 0.8, -0.35); teil(0.05, 0.05, 0.02, 0x111111, 0.08, 0.8, -0.35);
-      for (const x of [-0.1, 0.1]) beine.push(teil(0.06, 0.26, 0.06, 0xe0b020, x, 0.26, 0.02, 0.13));
+      const WEISS = 0xf7f7f4, WEISS2 = 0xe6e6df;
+      const koerper = teil(0.42, 0.38, 0.54, WEISS, 0, 0.46, 0.04);
+      f.schwanz = teil(0.26, 0.26, 0.08, WEISS2, 0, 0.64, 0.34); f.schwanz.rotation.x = 0.5;
+      teil(0.16, 0.22, 0.06, 0xd9d9d0, 0, 0.74, 0.37).rotation.x = 0.3;
+      for (const s of [-1, 1]) f.fluegel.push(teil(0.06, 0.26, 0.38, WEISS2, s * 0.24, 0.6, 0.04, 0.13));
+      const kopf = f.kopf = gruppe(g, 0, 0.62, -0.22);
+      teil(0.24, 0.3, 0.24, WEISS, 0, 0.1, -0.02, 0, kopf);
+      teil(0.06, 0.1, 0.18, 0xd6262a, 0, 0.3, -0.02, 0, kopf, true);
+      teil(0.1, 0.05, 0.12, 0xf2a81c, 0, 0.12, -0.17, 0, kopf, true);
+      teil(0.08, 0.03, 0.08, 0xe29210, 0, 0.07, -0.15, 0, kopf, true);
+      teil(0.05, 0.1, 0.04, 0xd6262a, 0, 0.0, -0.13, 0, kopf, true);
+      for (const s of [-1, 1]) teil(0.02, 0.06, 0.05, 0x111111, s * 0.125, 0.15, -0.07, 0, kopf, true);
+      for (const x of [-0.1, 0.1]) {
+        const bein = teil(0.06, 0.26, 0.06, 0xe3a824, x, 0.27, 0.02, 0.13, null, true);
+        teil(0.14, 0.03, 0.17, 0xe3a824, 0, -0.24, -0.04, 0, bein, true);
+        beine.push(bein);
+      }
+      f.koerper = koerper;
     } else {
-      teil(0.5, 0.5, 0.5, 0x5f9e4f, 0, 1.65, 0);
-      teil(0.1, 0.07, 0.02, 0x101010, -0.12, 1.68, -0.26); teil(0.1, 0.07, 0.02, 0x101010, 0.12, 1.68, -0.26);
-      teil(0.5, 0.7, 0.28, 0x2f8f9f, 0, 1.4, 0, 0.35);
-      const al = teil(0.22, 0.7, 0.22, 0x5f9e4f, -0.36, 1.35, 0, 0.3); al.rotation.x = -Math.PI / 2;
-      const ar = teil(0.22, 0.7, 0.22, 0x5f9e4f, 0.36, 1.35, 0, 0.3); ar.rotation.x = -Math.PI / 2;
-      beine.push(teil(0.24, 0.7, 0.26, 0x3a3a8a, -0.13, 0.7, 0, 0.35));
-      beine.push(teil(0.24, 0.7, 0.26, 0x3a3a8a, 0.13, 0.7, 0, 0.35));
+      const GRUEN = 0x6aa857, SHIRT = 0x2f8f9f, HOSE = 0x3a3a8a;
+      const kopf = f.kopf = gruppe(g, 0, 1.4, 0);
+      teil(0.5, 0.5, 0.5, GRUEN, 0, 0.26, 0, 0, kopf);
+      teil(0.53, 0.1, 0.53, 0x3b4a2e, 0, 0.5, 0.01, 0, kopf);
+      teil(0.1, 0.1, 0.04, 0x5b9549, 0, 0.2, -0.27, 0, kopf);
+      teil(0.22, 0.05, 0.02, 0x2a1a12, 0, 0.1, -0.255, 0, kopf, true);
+      for (const s of [-1, 1]) {
+        teil(0.13, 0.1, 0.02, 0x141c10, s * 0.12, 0.3, -0.255, 0, kopf, true);
+        teil(0.05, 0.05, 0.02, 0xff3b2b, s * 0.12, 0.3, -0.262, 0, kopf, false, true);
+      }
+      teil(0.5, 0.7, 0.28, SHIRT, 0, 1.4, 0, 0.35);
+      teil(0.52, 0.14, 0.3, 0x226f7c, 0, 0.78, 0);
+      teil(0.2, 0.18, 0.02, 0x3aa6b6, 0.1, 1.2, -0.15, 0, null, true);
+      for (const s of [-1, 1]) {
+        const arm = teil(0.22, 0.7, 0.22, GRUEN, s * 0.36, 1.35, 0, 0.3); arm.rotation.x = -Math.PI / 2;
+        teil(0.26, 0.3, 0.26, SHIRT, 0, -0.13, 0, 0, arm);
+        f.arme.push(arm);
+      }
+      for (const s of [-1, 1]) {
+        const bein = teil(0.24, 0.7, 0.26, HOSE, s * 0.13, 0.7, 0, 0.35);
+        teil(0.26, 0.12, 0.3, 0x2a2a30, 0, -0.64, -0.02, 0, bein);
+        beine.push(bein);
+      }
     }
     szene.add(g);
-    return { g, mats, beine, art, x: 0, y: 0, z: 0, tx: 0, ty: 0, tz: 0, ry: 0, tr: 0, verletzt: 0, phase: Math.random() * 6, neu: true };
+    // Kleinteile (Augen, Nasenloecher, Hufe ...) werden in der Ferne ausgeblendet -> weniger Zeichenaufrufe
+    const details = [];
+    g.traverse(o => { if (o.isMesh) { const gp = o.geometry.parameters; if (gp.width * gp.height * gp.depth < 0.016) details.push(o); } });
+    const sm = schattenFleck(art === 'huhn' ? 0.75 : art === 'zombie' ? 1.0 : 1.35);
+    return Object.assign({ g, mats, beine, art, sm, details, detailAn: true, x: 0, y: 0, z: 0, tx: 0, ty: 0, tz: 0, ry: 0, tr: 0, verletzt: 0, phase: Math.random() * 6, zeit: Math.random() * 20, neu: true }, f);
   }
   function tierEntfernen(id) {
     const t = tierAnsicht.get(id); if (!t) return;
-    szene.remove(t.g); t.g.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+    szene.remove(t.g); figurFreigeben(t.g);
+    szene.remove(t.sm); t.sm.material.dispose();
     tierAnsicht.delete(id);
   }
   function tiereAusListe(l) {
@@ -769,7 +1032,7 @@
     }
     for (const id of [...tierAnsicht.keys()]) if (!da.has(id)) tierEntfernen(id);
   }
-  const _farbe = new THREE.Color();
+  const _farbe = new THREE.Color(), _rot = new THREE.Color(1, 0.2, 0.2);
   // Helligkeit einer Figur aus dem Licht an ihrer Stelle
   function figurLicht(x, y, z) {
     const [s, b] = lichtBei(Math.floor(x), Math.floor(y + 0.5), Math.floor(z));
@@ -777,6 +1040,7 @@
     const ton = uniforms.himmelTon.value;
     return [Math.max(0.05, ton.r * sk, bl), Math.max(0.05, ton.g * sk, bl * 0.84), Math.max(0.05, ton.b * sk, bl * 0.62)];
   }
+  const glatt = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
   function tiereAktualisieren(dt) {
     const k = 1 - Math.exp(-14 * dt);
     for (const t of tierAnsicht.values()) {
@@ -785,18 +1049,206 @@
       let dr = t.tr - t.ry; while (dr > Math.PI) dr -= Math.PI * 2; while (dr < -Math.PI) dr += Math.PI * 2;
       t.ry += dr * k;
       const v = Math.hypot(t.x - vorX, t.z - vorZ) / Math.max(dt, 0.001);
-      t.phase += v * dt * 3.5;
+      t.phase += v * dt * 3.5; t.zeit += dt;
       const sw = Math.sin(t.phase) * Math.min(1, v / 1.5) * 0.7;
       t.beine.forEach((b, i) => { b.rotation.x = (i % 2 === (i < 2 ? 0 : 1) ? 1 : -1) * sw; });
+      // Ruhe-Animationen: Grasen, Picken, Ohrenzucken, Schwanzwedeln, Zombie-Schwanken
+      const ruhig = 1 - Math.min(1, v / 0.8), z = t.zeit;
+      if (t.art === 'huhn') {
+        t.kopf.rotation.x = Math.pow(Math.max(0, Math.sin(z * 3.6)), 8) * -0.9 * ruhig + Math.sin(t.phase * 2) * 0.14 * (1 - ruhig);
+        const flatter = glatt(2.2, 3.4, v);
+        t.fluegel.forEach((w, i) => { w.rotation.z = (i ? 1 : -1) * (0.1 + flatter * (0.75 + Math.sin(z * 38) * 0.45)); });
+        t.schwanz.rotation.x = 0.5 + Math.sin(z * 2.2) * 0.06;
+      } else if (t.art === 'zombie') {
+        t.arme.forEach((a, i) => { a.rotation.x = -Math.PI / 2 + Math.sin(z * 2.1 + i * 1.7) * 0.12; });
+        t.kopf.rotation.y = Math.sin(z * 1.1) * 0.18; t.kopf.rotation.x = Math.sin(z * 1.7) * 0.05;
+      } else {
+        const grasen = ruhig * glatt(0.55, 0.85, Math.sin(z * 0.36));
+        t.kopf.rotation.x = -grasen * 0.8 + Math.sin(z * 9) * 0.05 * grasen + Math.sin(z * 1.3) * 0.03;
+        t.ohren.forEach((o, i) => { if (o.userData.z0 === undefined) o.userData.z0 = o.rotation.z; o.rotation.z = o.userData.z0 + Math.sin(z * 1.9 + i * 2.4) * 0.07 + Math.pow(Math.max(0, Math.sin(z * 0.9 + i)), 20) * (i ? -0.5 : 0.5); });
+        t.schwanz.rotation.y = Math.sin(z * 4.5) * 0.35 * (0.4 + 0.6 * (1 - ruhig));
+      }
+      // Entfernung zur Kamera: jenseits des Nebels gar nicht zeichnen, Kleinteile nur in der Naehe
+      const ad = (t.x - kamera.position.x) ** 2 + (t.z - kamera.position.z) ** 2, fern = szene.fog.far + 6;
+      t.g.visible = ad < fern * fern;
+      const nah = ad < 22 * 22;
+      if (nah !== t.detailAn) { t.detailAn = nah; for (const o of t.details) o.visible = nah; }
       t.g.position.set(t.x, t.y, t.z); t.g.rotation.y = t.ry;
+      t.g.rotation.z = t.verletzt ? Math.sin(z * 50) * 0.07 : 0;
+      schattenSetzen(t.sm, t.x, t.y, t.z, 0.6);
       const l = figurLicht(t.x, t.y, t.z);
       for (const [mat, basis] of t.mats) {
         _farbe.copy(basis);
-        if (t.verletzt) _farbe.lerp(new THREE.Color(1, 0.2, 0.2), 0.6);
+        if (t.verletzt) _farbe.lerp(_rot, 0.6);
         mat.color.setRGB(_farbe.r * l[0], _farbe.g * l[1], _farbe.b * l[2]);
       }
     }
   }
+  /* ---------- Gegenstaende in der Hand und herumfliegende Beute (nur Optik) ---------- */
+  // Waffen/Werkzeuge/Pflanzen werden als aufgeblasene Pixelbilder (16x16, mit Tiefe) gezeichnet, Bloecke als kleine Wuerfel mit Kacheln.
+  const modellGeo = new Map();   // id -> { geo, block }
+  function pixelBildVon(id) {
+    if (id < W.ANZAHL) return Texturen.flachSymbol(atlasCanvas, W.TAB[id][1], 16);
+    const s = D.info(id).symbol; return Texturen.gegenstandPixel(s.form, s.farbe);
+  }
+  function pixelGeo(canvas) {
+    const d = canvas.getContext('2d').getImageData(0, 0, 16, 16).data;
+    const pos = [], col = [], idx = [];
+    const voll = (x, y) => x >= 0 && y >= 0 && x < 16 && y < 16 && d[(y * 16 + x) * 4 + 3] > 100;
+    const T = 1.4 / 16, z1 = T / 2, z0 = -T / 2, P = 1 / 16;
+    let n = 0;
+    const viereck = (a, b, c, e, r, g, bl, sh) => {
+      for (const q of [a, b, c, e]) { pos.push(q[0], q[1], q[2]); col.push(r * sh, g * sh, bl * sh); }
+      idx.push(n, n + 1, n + 2, n, n + 2, n + 3); n += 4;
+    };
+    for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+      if (!voll(x, y)) continue;
+      const o = (y * 16 + x) * 4, r = d[o] / 255, g = d[o + 1] / 255, bl = d[o + 2] / 255;
+      const x0 = (x - 8) * P, x1 = x0 + P, y1 = (8 - y) * P, y0 = y1 - P;
+      viereck([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], r, g, bl, 1);
+      viereck([x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0], r, g, bl, 0.78);
+      if (!voll(x - 1, y)) viereck([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0], r, g, bl, 0.62);
+      if (!voll(x + 1, y)) viereck([x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1], r, g, bl, 0.7);
+      if (!voll(x, y - 1)) viereck([x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0], r, g, bl, 0.95);
+      if (!voll(x, y + 1)) viereck([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], r, g, bl, 0.5);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    geo.setIndex(idx);
+    return geo;
+  }
+  function wuerfelGeo(id) {
+    const geo = new THREE.BoxGeometry(1, 1, 1), uv = geo.attributes.uv, kt = KACHEL[id];
+    const kacheln = [kt[2], kt[2], kt[0], kt[1], kt[2], kt[2]];   // +x, -x, oben, unten, +z, -z
+    const col = new Float32Array(72), ein = 0.02;
+    for (let f = 0; f < 6; f++) {
+      const k = kacheln[f], cx = k % Texturen.SPALTEN, cy = Math.floor(k / Texturen.SPALTEN);
+      const u0 = (cx * ZEL + RND + ein) / ATLAS_B, u1 = (cx * ZEL + RND + PXT - ein) / ATLAS_B;
+      const vo = 1 - (cy * ZEL + RND + ein) / ATLAS_H, vu = 1 - (cy * ZEL + RND + PXT - ein) / ATLAS_H;
+      for (let v = 0; v < 4; v++) {
+        uv.setXY(f * 4 + v, v % 2 ? u1 : u0, v < 2 ? vo : vu);
+        col[(f * 4 + v) * 3] = col[(f * 4 + v) * 3 + 1] = col[(f * 4 + v) * 3 + 2] = FLAECHEN_TON[f];
+      }
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    return geo;
+  }
+  function modellVon(id) {
+    let m = modellGeo.get(id);
+    if (!m) {
+      const block = id < W.ANZAHL && FORM[id] === 'w';
+      m = { block, geo: block ? wuerfelGeo(id) : pixelGeo(pixelBildVon(id)) };
+      modellGeo.set(id, m);
+    }
+    return m;
+  }
+  // Materialien: je eines fuer die Hand (immer sichtbar, ohne Tiefentest) und fuer fliegende Beute
+  const stoffe = {
+    handBlock: new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true, alphaTest: 0.5, depthTest: false }),
+    handBild: new THREE.MeshBasicMaterial({ vertexColors: true, depthTest: false }),
+    handArm: new THREE.MeshBasicMaterial({ color: 0xe8b890, vertexColors: true, map: fellTex, depthTest: false }),
+    dropBlock: new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true, alphaTest: 0.5 }),
+    dropBild: new THREE.MeshBasicMaterial({ vertexColors: true })
+  };
+  const handGruppe = new THREE.Group();
+  handGruppe.visible = false;
+  kamera.add(handGruppe);
+  const armGeo = figurBox(0.2, 0.2, 0.7, 0);
+  let handModell = null, handId = -1, handWechsel = 0, handSchlag = 0, handAbbauPhase = 0, handV = 0, handBob = 0;
+  // Grundhaltung je Art: Position, Drehung, Groesse
+  const HALTUNG = {
+    block: { p: [0.32, -0.26, -0.58], r: [0.12, 0.7, 0], s: 0.15 },
+    bild: { p: [0.28, -0.2, -0.52], r: [0.1, -0.5, -0.5], s: 0.3 },
+    arm: { p: [0.34, -0.3, -0.5], r: [0.95, 0.25, 0], s: 1 }
+  };
+  let handArt = 'arm';
+  function handBauen(id) {
+    if (handModell) { handGruppe.remove(handModell); handModell = null; }
+    if (!id) {
+      handModell = new THREE.Mesh(armGeo, stoffe.handArm); handArt = 'arm';
+    } else {
+      const m = modellVon(id);
+      handModell = new THREE.Mesh(m.geo, m.block ? stoffe.handBlock : stoffe.handBild);
+      handArt = m.block ? 'block' : 'bild';
+      // Fackel und Pflanzen sind flach und leicht: etwas kleiner
+      if (!m.block && id < W.ANZAHL) handModell.userData.klein = 0.8;
+    }
+    handModell.renderOrder = 50;
+    handGruppe.add(handModell);
+  }
+  function handAktualisieren(dt, aktiv, abbauend) {
+    handGruppe.visible = spielLaeuft && !ueberlagerung;
+    if (!handGruppe.visible) return;
+    const id = inHand();
+    if (id !== handId) { handWechsel += dt * 6; if (handWechsel >= 1 || !handModell) { handBauen(id); handId = id; handWechsel = Math.max(handWechsel, 1); } }
+    else handWechsel = Math.max(0, handWechsel - dt * 6);
+    const h = HALTUNG[handArt], klein = handModell.userData.klein || 1;
+    // Schwung beim Abbauen (Dauerschlag) oder bei Einzelaktionen
+    let sw = 0;
+    if (handSchlag > 0) handSchlag -= dt;
+    if (abbauend) { handAbbauPhase += dt / 0.4; sw = Math.sin((handAbbauPhase % 1) * Math.PI); }
+    else { handAbbauPhase = 0; if (handSchlag > 0) sw = Math.sin((1 - handSchlag / 0.26) * Math.PI); }
+    // Wippen beim Gehen
+    const v = Math.hypot(spieler.vx, spieler.vz) * (spieler.boden || spieler.fliegen ? 1 : 0.3);
+    handV += (v - handV) * Math.min(1, 8 * dt);
+    handBob += dt * (3 + handV * 1.1);
+    const amp = Math.min(1, handV / 4) * 0.014, ruhe = Math.sin(handBob * 0.35) * 0.0035;
+    const tief = handWechsel * handWechsel * 0.5;
+    handModell.position.set(h.p[0] + Math.cos(handBob) * amp - sw * 0.1, h.p[1] - Math.abs(Math.sin(handBob)) * amp * 1.4 + ruhe - tief + sw * 0.02, h.p[2] - sw * 0.16);
+    handModell.rotation.set(h.r[0] - sw * 0.95, h.r[1] + sw * 0.35, h.r[2] + sw * 0.12);
+    handModell.scale.setScalar(h.s * klein);
+    if (handArt === 'arm') handModell.scale.set(1, 1, 1);
+    const l = figurLicht(spieler.x, spieler.y, spieler.z);
+    stoffe.handBlock.color.setRGB(l[0], l[1], l[2]); stoffe.handBild.color.setRGB(l[0], l[1], l[2]); stoffe.handArm.color.setRGB(0.91 * l[0], 0.72 * l[1], 0.56 * l[2]);
+  }
+  function handSchlagen() { handSchlag = 0.26; }
+
+  // Beute fliegt aus dem Block / Tier hoch und wird dann zum Spieler gesogen. Das Einsammeln selbst bleibt sofort (Spiellogik unveraendert).
+  const drops = [];
+  let letzterTreffer = null;
+  function dropsNeu(liste, q) {
+    if (!q) return;
+    for (const [id, n] of liste) {
+      for (let i = 0; i < Math.min(n, 3) && drops.length < 24; i++) {
+        const m = modellVon(id);
+        const mesh = new THREE.Mesh(m.geo, m.block ? stoffe.dropBlock : stoffe.dropBild);
+        const gr = m.block ? 0.24 : (id < W.ANZAHL ? 0.32 : 0.4);
+        mesh.userData.gr = gr; mesh.scale.setScalar(gr);
+        mesh.position.set(q.x + (Math.random() - 0.5) * 0.3, q.y, q.z + (Math.random() - 0.5) * 0.3);
+        mesh.rotation.y = Math.random() * 6;
+        szene.add(mesh);
+        drops.push({ mesh, t: -i * 0.06, vx: (Math.random() - 0.5) * 2.4, vy: 3 + Math.random() * 1.6, vz: (Math.random() - 0.5) * 2.4, tempo: 4 });
+      }
+    }
+  }
+  function dropsBewegen(dt) {
+    if (!drops.length) return;
+    const l = figurLicht(spieler.x, spieler.y + 1, spieler.z);
+    stoffe.dropBlock.color.setRGB(l[0], l[1], l[2]); stoffe.dropBild.color.setRGB(l[0], l[1], l[2]);
+    for (let i = drops.length - 1; i >= 0; i--) {
+      const d = drops[i], m = d.mesh;
+      d.t += dt;
+      if (d.t < 0) { m.visible = false; continue; }
+      m.visible = true;
+      m.rotation.y += dt * 4;
+      if (d.t < 0.38) {
+        d.vy -= 20 * dt;
+        m.position.x += d.vx * dt; m.position.z += d.vz * dt;
+        const ny = m.position.y + d.vy * dt;
+        if (d.vy < 0 && OPAK[getBlock(Math.floor(m.position.x), Math.floor(ny - 0.12), Math.floor(m.position.z))]) { d.vy = 0; d.vx *= 0.5; d.vz *= 0.5; }
+        else m.position.y = ny;
+      } else {
+        d.tempo = Math.min(20, d.tempo + 46 * dt);
+        const dx = spieler.x - m.position.x, dy = spieler.y + 1.0 - m.position.y, dz = spieler.z - m.position.z, ab = Math.hypot(dx, dy, dz);
+        if (ab < 0.5 || d.t > 1.8) { szene.remove(m); drops.splice(i, 1); continue; }
+        const s = Math.min(ab, d.tempo * dt) / ab;
+        m.position.x += dx * s; m.position.y += dy * s; m.position.z += dz * s;
+        m.scale.setScalar(m.userData.gr * Math.min(1, ab / 1.2 + 0.25));
+      }
+    }
+  }
+
   // Strahl gegen Tier-Kisten: liefert {id, t} des naechsten Treffers
   function tierImVisier(o, d, max) {
     let best = null;
@@ -871,8 +1323,9 @@
   }
 
   /* ---------- Abbauen, Setzen, Hauen, Essen ---------- */
-  function beuteEinsammeln(liste, ohnePunkte) {
+  function beuteEinsammeln(liste, ohnePunkte, quelle) {
     if (!ueberleben()) return;
+    dropsNeu(liste, quelle);
     for (const [id, n] of liste) {
       const rest = inv.hinzu(id, n);
       if (rest < n) { meldungKlein('+' + (n - rest) + ' ' + name(id)); if (!ohnePunkte) olympGesammelt(id, n - rest); }
@@ -881,16 +1334,21 @@
     hotbarZeichnen();
   }
   // Block wirklich entfernen (mit Beute, Partikeln und Pflanzen obendrauf)
+  function blockHell(x, y, z) {
+    const l = lichtBei(x, y, z);
+    return Math.max(0.15, Math.pow(0.8, 15 - Math.max(l[0] * uniforms.tag.value, l[1])));
+  }
   function brechen(x, y, z) {
     const b = getBlock(x, y, z);
     if (!b || b === W.GRUND) return false;
-    const l = lichtBei(x, y + 1, z);
-    partikelSpruehen(x, y, z, b, Math.max(0.15, Math.pow(0.8, 15 - Math.max(l[0] * uniforms.tag.value, l[1]))));
+    partikelSpruehen(x, y, z, b, blockHell(x, y + 1, z));
+    handSchlagen();
+    const quelle = { x: x + 0.5, y: y + 0.45, z: z + 0.5 };
     blockAendern(x, y, z, 0);
     const eigener = olympEigenerBlock(x, y, z, true);   // Olympiade: selbst gesetzte Bloecke bringen keine Punkte
     if (ueberleben()) {
       const a = D.abbau(b, inHand());
-      beuteEinsammeln(D.beute(b, a.ernte), eigener);
+      beuteEinsammeln(D.beute(b, a.ernte), eigener, quelle);
       const w = D.werkzeug(inHand());
       if (w && W.TAB[b][6] > 0 && w.typ !== 'w') { if (inv.abnutzen(gewaehlt)) meldung('Dein Werkzeug ist zerbrochen.'); hotbarZeichnen(); }
     }
@@ -899,7 +1357,7 @@
     if (W.BRAUCHT_BODEN[oben]) {
       const eigenerOben = olympEigenerBlock(x, y + 1, z, true);
       blockAendern(x, y + 1, z, 0);
-      if (ueberleben()) beuteEinsammeln(D.beute(oben, true), eigenerOben);
+      if (ueberleben()) beuteEinsammeln(D.beute(oben, true), eigenerOben, { x: x + 0.5, y: y + 1.45, z: z + 0.5 });
     }
     return true;
   }
@@ -907,11 +1365,14 @@
   function hauen() {
     if (!zielTier || hauSperre > 0) return false;
     hauSperre = 0.4;
+    handSchlagen();
+    const tv = tierAnsicht.get(zielTier.id);
+    if (tv) letzterTreffer = { x: tv.x, y: tv.y + 0.7, z: tv.z, zeit: performance.now() };
     const s = D.schaden(inHand());
     if (modus === 'online') schicke({ t: 'hau', id: zielTier.id, s });
     else if (tiereLokal) {
       const erg = tiereLokal.hau(zielTier.id, s, spieler.x, spieler.z);
-      if (erg && erg.beute.length) beuteEinsammeln(erg.beute);
+      if (erg && erg.beute.length) beuteEinsammeln(erg.beute, false, letzterTreffer);
     }
     if (ueberleben() && D.werkzeug(inHand())) { if (inv.abnutzen(gewaehlt)) meldung('Dein Werkzeug ist zerbrochen.'); hotbarZeichnen(); }
     return true;
@@ -927,6 +1388,7 @@
     }
     if (!Number.isFinite(abbau.zeit)) { abbauStop(); return; }
     abbau.f += dt;
+    if (abbau.zeit > 0.1) { abbau.chip = (abbau.chip || 0) - dt; if (abbau.chip <= 0) { abbau.chip = 0.15; partikelSplitter(ziel, blockHell(ziel.x + ziel.nx, ziel.y + ziel.ny, ziel.z + ziel.nz)); } }
     const stufe = Math.min(7, Math.floor(abbau.f / Math.max(0.01, abbau.zeit) * 8));
     risseTex.offset.x = stufe / 8;
     risse.position.set(abbau.x + 0.5, abbau.y + 0.5, abbau.z + 0.5);
@@ -972,6 +1434,7 @@
     }
     if (alt && PFLANZE[alt] && ueberleben()) beuteEinsammeln(D.beute(alt, true));
     blockAendern(x, y, z, hand);
+    handSchlagen(); partikelSpruehen(x, y, z, hand, blockHell(x, y + 1, z), 6, true);
     olympEigenerBlock(x, y, z, false, true);
     if (ueberleben()) { inv.nimm(gewaehlt, 1); hotbarZeichnen(); }
     return true;
@@ -1162,25 +1625,31 @@
   function avatar(id, nm) {
     const farbe = new THREE.Color().setHSL(((id * 0.137) % 1), 0.65, 0.5);
     const hose = new THREE.Color().setHSL(((id * 0.137 + 0.5) % 1), 0.35, 0.28);
+    const haar = new THREE.Color().setHSL(((id * 0.31) % 1) * 0.12 + 0.04, 0.5, 0.2 + ((id * 7) % 5) * 0.06);
     const g = new THREE.Group();
-    const mats = [];
-    const teil = (b, h, t, col, x, y, z, pivotY) => {
-      const geo = new THREE.BoxGeometry(b, h, t); geo.translate(0, -pivotY, 0);
-      const mat = new THREE.MeshBasicMaterial({ color: col });
-      mats.push([mat, new THREE.Color(col)]);
-      const m = new THREE.Mesh(geo, mat);
-      m.position.set(x, y, z); g.add(m); return m;
-    };
-    const kopf = teil(0.5, 0.5, 0.5, HAUT, 0, 1.55, 0, 0);
+    const { teil, mats } = bauteile(g);
+    const kopf = gruppe(g, 0, 1.3, 0);
+    teil(0.5, 0.5, 0.5, HAUT, 0, 0.25, 0, 0, kopf);
+    teil(0.54, 0.14, 0.54, haar, 0, 0.5, 0, 0, kopf);
+    teil(0.54, 0.4, 0.1, haar, 0, 0.3, 0.22, 0, kopf);
+    teil(0.54, 0.1, 0.1, haar, 0, 0.42, -0.22, 0, kopf);
+    for (const s of [-1, 1]) {
+      teil(0.12, 0.1, 0.02, 0xffffff, s * 0.12, 0.27, -0.255, 0, kopf, true);
+      teil(0.06, 0.09, 0.02, 0x2a3a6a, s * 0.135, 0.27, -0.262, 0, kopf, true);
+    }
+    teil(0.14, 0.03, 0.02, 0xb86a5a, 0, 0.1, -0.255, 0, kopf, true);
     teil(0.5, 0.7, 0.28, farbe, 0, 1.3, 0, 0.35);
+    teil(0.52, 0.06, 0.3, 0x3a2a1a, 0, 0.73, 0);
     const armL = teil(0.22, 0.7, 0.22, farbe, -0.36, 1.3, 0, 0.3);
     const armR = teil(0.22, 0.7, 0.22, farbe, 0.36, 1.3, 0, 0.3);
+    for (const a of [armL, armR]) teil(0.2, 0.14, 0.2, HAUT, 0, -0.58, 0, 0, a);
     const beinL = teil(0.24, 0.7, 0.26, hose, -0.13, 0.7, 0, 0.35);
     const beinR = teil(0.24, 0.7, 0.26, hose, 0.13, 0.7, 0, 0.35);
-    teil(0.1, 0.08, 0.02, 0x222233, -0.12, 1.6, -0.26, 0); teil(0.1, 0.08, 0.02, 0x222233, 0.12, 1.6, -0.26, 0);
+    for (const b of [beinL, beinR]) teil(0.26, 0.12, 0.32, 0x2b2b33, 0, -0.64, -0.03, 0, b);
     const schild = namensschild(nm); schild.position.y = 2.15; g.add(schild);
     szene.add(g);
-    return { id, name: nm, g, mats, kopf, armL, armR, beinL, beinR, x: 0, y: 0, z: 0, tx: 0, ty: 0, tz: 0, ry: 0, tr: 0, rp: 0, phase: 0, neu: true };
+    const sm = schattenFleck(1.1);
+    return { id, name: nm, g, mats, kopf, armL, armR, beinL, beinR, sm, x: 0, y: 0, z: 0, tx: 0, ty: 0, tz: 0, ry: 0, tr: 0, rp: 0, phase: 0, zeit: Math.random() * 10, neu: true };
   }
   function andereHinzu(id, nm, p) {
     if (andere.has(id) || id === meineId) return;
@@ -1190,7 +1659,8 @@
   }
   function andereEntfernen(id) {
     const a = andere.get(id); if (!a) return;
-    szene.remove(a.g); a.g.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); } });
+    szene.remove(a.g); figurFreigeben(a.g);
+    szene.remove(a.sm); a.sm.material.dispose();
     andere.delete(id); listeZeichnen();
   }
   function andereAktualisieren(dt) {
@@ -1201,11 +1671,14 @@
       let dr = a.tr - a.ry; while (dr > Math.PI) dr -= Math.PI * 2; while (dr < -Math.PI) dr += Math.PI * 2;
       a.ry += dr * k;
       const v = Math.hypot(a.x - vorX, a.z - vorZ) / Math.max(dt, 0.001);
-      a.phase += v * dt * 2.2;
+      a.phase += v * dt * 2.2; a.zeit += dt;
       const sw = Math.sin(a.phase) * Math.min(1, v / 3) * 0.9;
       a.armL.rotation.x = sw; a.armR.rotation.x = -sw; a.beinL.rotation.x = -sw; a.beinR.rotation.x = sw;
+      a.armL.rotation.z = 0.04 + Math.sin(a.zeit * 1.6) * 0.02; a.armR.rotation.z = -0.04 - Math.sin(a.zeit * 1.6) * 0.02;
+      a.kopf.rotation.x = Math.max(-1.1, Math.min(1.1, Number(a.rp) || 0));
       a.g.position.set(a.x, a.y, a.z);
       a.g.rotation.y = a.ry;
+      schattenSetzen(a.sm, a.x, a.y, a.z, 0.55);
       const l = figurLicht(a.x, a.y + 1, a.z);
       for (const [mat, basis] of a.mats) mat.color.setRGB(basis.r * l[0], basis.g * l[1], basis.b * l[2]);
     }
@@ -1262,7 +1735,7 @@
       case 'chat': chatZeile(m.name, m.text, false); break;
       case 'tiere': tiereAusListe(m.l); break;
       case 'schaden': schadenNehmen(m.s, { x: m.x, z: m.z }); break;
-      case 'beute': beuteEinsammeln(m.l); break;
+      case 'beute': beuteEinsammeln(m.l, false, letzterTreffer && performance.now() - letzterTreffer.zeit < 4000 ? letzterTreffer : null); break;
       case 'welt': weltLaden(m.seed, m.a); chunksAktualisieren(true); freiStellen(); meldung('Welt aus einer Sicherung wiederhergestellt.'); break;
     }
   }
@@ -1292,32 +1765,48 @@
   }
 
   /* ---------- Tageszeit ---------- */
-  const HIMMEL_TAG = new THREE.Color(0x87ceeb), HIMMEL_NACHT = new THREE.Color(0x060a16), HIMMEL_ROT = new THREE.Color(0xff9a5a);
+  // Himmelsfarben: Horizont (= Nebelfarbe) und Zenit, je Tag / Nacht / Daemmerung
+  const HORIZONT_TAG = new THREE.Color(0x9bd3f2), HORIZONT_NACHT = new THREE.Color(0x0b1426), HIMMEL_ROT = new THREE.Color(0xff9a5a);
+  const ZENIT_TAG = new THREE.Color(0x3d83d6), ZENIT_NACHT = new THREE.Color(0x02050d), ZENIT_ROT = new THREE.Color(0x4a5aa0);
   const TON_TAG = new THREE.Color(1, 1, 1), TON_NACHT = new THREE.Color(0.55, 0.62, 1), TON_ROT = new THREE.Color(1, 0.78, 0.62);
+  const SONNE_TAG = new THREE.Color(1, 0.96, 0.82), SONNE_ROT = new THREE.Color(1, 0.55, 0.25);
   const himmel = new THREE.Color();
-  let wolkenDrift = 0;
+  const _wolkenFarbe = new THREE.Color(), _weiss = new THREE.Color(1, 1, 1);
+  let wolkenDrift = 0, himmelZeit = 0;
   function himmelAktualisieren(dt) {
+    himmelZeit += dt;
+    uniforms.zeit.value = himmelZeit;
     const winkel = tageszeit * Math.PI * 2, hoehe = Math.sin(winkel);
     const licht = W.tageslicht(tageszeit);
-    himmel.copy(HIMMEL_NACHT).lerp(HIMMEL_TAG, licht);
     const daemmerung = Math.max(0, 1 - Math.abs(hoehe) / 0.22) * 0.55;
-    himmel.lerp(HIMMEL_ROT, daemmerung);
+    himmel.copy(HORIZONT_NACHT).lerp(HORIZONT_TAG, licht).lerp(HIMMEL_ROT, daemmerung);
+    uniforms.himmelHorizont.value.copy(himmel);
+    uniforms.himmelZenit.value.copy(ZENIT_NACHT).lerp(ZENIT_TAG, licht).lerp(ZENIT_ROT, daemmerung * 0.6);
     szene.background = himmel; szene.fog.color.copy(himmel);
     uniforms.tag.value = 0.13 + 0.87 * licht;
     uniforms.himmelTon.value.copy(TON_NACHT).lerp(TON_TAG, licht).lerp(TON_ROT, daemmerung * 0.8);
     const d = 400;
     const px = kamera.position.x, py = kamera.position.y, pz = kamera.position.z;
-    sonne.position.set(px + Math.cos(winkel) * d, py + Math.sin(winkel) * d, pz + 40);
-    mond.position.set(px - Math.cos(winkel) * d, py - Math.sin(winkel) * d, pz + 40);
+    const sx = Math.cos(winkel), sy = hoehe, sz = 0.1, sl = Math.hypot(sx, sy, sz);
+    uniforms.sonnenRichtung.value.set(sx / sl, sy / sl, sz / sl);
+    uniforms.sonnenFarbe.value.copy(SONNE_TAG).lerp(SONNE_ROT, Math.min(1, daemmerung * 1.6));
+    uniforms.sonnenStaerke.value = Math.max(0, Math.min(1, (hoehe + 0.12) / 0.3));
+    himmelKuppel.position.copy(kamera.position);
+    sonne.position.set(px + sx * d, py + sy * d, pz + sz * d);
+    mond.position.set(px - sx * d, py - sy * d, pz - sz * d);
     sonne.lookAt(kamera.position); mond.lookAt(kamera.position);
+    sonne.material.color.setRGB(1, 1, 1).lerp(uniforms.sonnenFarbe.value, 0.5);
+    sonne.scale.setScalar(1 + daemmerung * 0.5);
     sterne.position.copy(kamera.position);
-    sterne.material.opacity = Math.max(0, 1 - licht * 1.6);
+    sterne.material.opacity = Math.max(0, 1 - licht * 1.6) * (0.85 + 0.15 * Math.sin(himmelZeit * 2.3));
     sterne.rotation.z = winkel * 0.3;
     // Wolken ziehen langsam nach Osten
     wolkenDrift += dt * 1.2;
     wolken.position.set(px, CH + 26, pz);
-    wolkenTex.offset.set((px + wolkenDrift) / WOLKEN_GROESSE, -pz / WOLKEN_GROESSE);
-    wolken.material.color.copy(TON_NACHT).multiplyScalar(0.25).lerp(new THREE.Color(1, 1, 1), licht).lerp(HIMMEL_ROT, daemmerung * 0.4);
+    wolkenUniforms.versatz.value.set((px + wolkenDrift) / WOLKEN_GROESSE, -pz / WOLKEN_GROESSE);
+    _wolkenFarbe.copy(TON_NACHT).multiplyScalar(0.17).lerp(_weiss, licht).lerp(HIMMEL_ROT, daemmerung * 0.45);
+    wolkenUniforms.farbe.value.copy(_wolkenFarbe);
+    wolkenUniforms.deckkraft.value = 0.9 * (0.4 + 0.6 * licht);
   }
 
   /* ---------- Eingabe: Tastatur und Maus ---------- */
@@ -1889,6 +2378,7 @@
     }
     tiereAktualisieren(dt);
     partikelBewegen(dt);
+    dropsBewegen(dt);
 
     kamera.position.set(spieler.x, spieler.y + AUGE, spieler.z);
     kamera.rotation.set(spieler.pitch, spieler.yaw, 0);
@@ -1903,8 +2393,11 @@
       }
       if (touch) { touchHalten(dt); flugKnoepfe(); }
     }
+    handAktualisieren(dt, aktiv, aktiv && (mausLinks || !!abbau) && (!!ziel || !!zielTier));
     // Nebel (unter Wasser dichter und blau)
     const unterWasser = getBlock(Math.floor(spieler.x), Math.floor(spieler.y + AUGE), Math.floor(spieler.z)) === W.WASSER;
+    himmelKuppel.visible = mond.visible = sterne.visible = wolken.visible = !unterWasser;
+    sonne.visible = !unterWasser && uniforms.sonnenStaerke.value > 0.02;
     if (unterWasser) { szene.fog.near = 1; szene.fog.far = 22; szene.fog.color.setRGB(0.1, 0.25, 0.5).multiplyScalar(0.3 + 0.7 * uniforms.tag.value); szene.background = szene.fog.color; }
     else { szene.fog.near = sicht * CX * 0.5; szene.fog.far = sicht * CX * 0.95; }
     uniforms.nebelFarbe.value.copy(szene.fog.color); uniforms.nebelNah.value = szene.fog.near; uniforms.nebelFern.value = szene.fog.far;
