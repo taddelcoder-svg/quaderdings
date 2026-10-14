@@ -1328,7 +1328,7 @@
     dropsNeu(liste, quelle);
     for (const [id, n] of liste) {
       const rest = inv.hinzu(id, n);
-      if (rest < n) { meldungKlein('+' + (n - rest) + ' ' + name(id)); if (!ohnePunkte) olympGesammelt(id, n - rest); }
+      if (rest < n) { meldungKlein('+' + (n - rest) + ' ' + name(id)); if (!ohnePunkte) olympGesammelt(id, n - rest); window.SLZaehle && SLZaehle('sl_quader', s => { s.gesamt = (s.gesamt || 0) + (n - rest); (s.arten = s.arten || {})[id] = 1; s.von = W.PLATZIERBAR.length; }); }
       if (rest > 0) meldung('Dein Inventar ist voll.');
     }
     hotbarZeichnen();

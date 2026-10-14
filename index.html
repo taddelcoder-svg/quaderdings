@@ -545,6 +545,13 @@
 </script>
 
 <!-- Rangliste der Spielesammlung: meldet Spielzeit, Punkte und Progress -->
+<script>
+window.SLZaehle=function(k,f){try{var s=JSON.parse(localStorage.getItem(k))||{};f(s);localStorage.setItem(k,JSON.stringify(s))}catch(e){}};
+window.SLRangAdapter=function(){
+  var s={};try{s=JSON.parse(localStorage.getItem('sl_quader'))||{}}catch(e){}
+  return{punkte:s.gesamt||0,progress:Math.min(100,Object.keys(s.arten||{}).length/(s.von||20)*100)}
+};
+</script>
 <script src="https://rangliste-aoee.onrender.com/melder.js" data-spiel="Quaderland" defer></script>
 </body>
 </html>
